@@ -267,14 +267,14 @@ impl App {
                 Err(e) => { eprintln!("capture start: {e}"); return; }
             };
             let mut detector = DeltaDetector::new(config);
+            let frame_budget = std::time::Duration::from_nanos(1_000_000_000 / 30);
             while !stop_thread.load(Ordering::Relaxed) {
+                let frame_start = std::time::Instant::now();
                 match capturer.next_frame() {
                     Ok(frame) => {
                         let frame = Arc::new(frame);
                         let dirty = detector.feed(frame.clone());
                         if !dirty.is_empty() {
-                            let px: u64 = dirty.iter().map(|r| r.area()).sum();
-                            println!("dirty: {} rects, {} px", dirty.len(), px);
                             if let Some(b) = &broadcaster {
                                 b.broadcast(Arc::new(net::BroadcastMsg::VideoFrame {
                                     rects: dirty,
@@ -288,6 +288,10 @@ impl App {
                         stop_thread.store(true, Ordering::Relaxed);
                         break;
                     }
+                }
+                let elapsed = frame_start.elapsed();
+                if elapsed < frame_budget {
+                    std::thread::sleep(frame_budget - elapsed);
                 }
             }
         });

@@ -305,6 +305,9 @@ impl ApplicationHandler for ClientApp {
                                 let _ = self.send_tx.send(ClientSend::ChatMessage(text));
                             }
                         }
+                        Key::Named(NamedKey::Space) => {
+                            self.chat_input.push(' ');
+                        }
                         Key::Character(s) => {
                             for ch in s.chars() {
                                 if !ch.is_control() {
