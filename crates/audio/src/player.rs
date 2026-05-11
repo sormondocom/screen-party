@@ -135,9 +135,12 @@ fn fill_output(data: &mut Data, acc: &mut VecDeque<f32>) {
     match data.sample_format() {
         SampleFormat::F32 => {
             if let Some(s) = data.as_slice_mut::<f32>() {
-                for out in s.iter_mut() {
-                    *out = acc.pop_front().unwrap_or(0.0);
-                }
+                for out in s.iter_mut() { *out = acc.pop_front().unwrap_or(0.0); }
+            }
+        }
+        SampleFormat::F64 => {
+            if let Some(s) = data.as_slice_mut::<f64>() {
+                for out in s.iter_mut() { *out = acc.pop_front().unwrap_or(0.0) as f64; }
             }
         }
         SampleFormat::I16 => {
@@ -147,10 +150,24 @@ fn fill_output(data: &mut Data, acc: &mut VecDeque<f32>) {
                 }
             }
         }
+        SampleFormat::I32 => {
+            if let Some(s) = data.as_slice_mut::<i32>() {
+                for out in s.iter_mut() {
+                    *out = (acc.pop_front().unwrap_or(0.0) * i32::MAX as f32) as i32;
+                }
+            }
+        }
         SampleFormat::U16 => {
             if let Some(s) = data.as_slice_mut::<u16>() {
                 for out in s.iter_mut() {
                     *out = ((acc.pop_front().unwrap_or(0.0) + 1.0) * 32_768.0) as u16;
+                }
+            }
+        }
+        SampleFormat::U32 => {
+            if let Some(s) = data.as_slice_mut::<u32>() {
+                for out in s.iter_mut() {
+                    *out = ((acc.pop_front().unwrap_or(0.0) + 1.0) * 2_147_483_648.0) as u32;
                 }
             }
         }
@@ -162,13 +179,22 @@ fn fill_output(data: &mut Data, acc: &mut VecDeque<f32>) {
 fn fill_silence(data: &mut Data) {
     match data.sample_format() {
         SampleFormat::F32 => {
-            if let Some(s) = data.as_slice_mut::<f32>()  { s.fill(0.0); }
+            if let Some(s) = data.as_slice_mut::<f32>() { s.fill(0.0); }
+        }
+        SampleFormat::F64 => {
+            if let Some(s) = data.as_slice_mut::<f64>() { s.fill(0.0); }
         }
         SampleFormat::I16 => {
-            if let Some(s) = data.as_slice_mut::<i16>()  { s.fill(0); }
+            if let Some(s) = data.as_slice_mut::<i16>() { s.fill(0); }
+        }
+        SampleFormat::I32 => {
+            if let Some(s) = data.as_slice_mut::<i32>() { s.fill(0); }
         }
         SampleFormat::U16 => {
-            if let Some(s) = data.as_slice_mut::<u16>()  { s.fill(32_768); }
+            if let Some(s) = data.as_slice_mut::<u16>() { s.fill(32_768); }
+        }
+        SampleFormat::U32 => {
+            if let Some(s) = data.as_slice_mut::<u32>() { s.fill(2_147_483_648); }
         }
         _ => {}
     }

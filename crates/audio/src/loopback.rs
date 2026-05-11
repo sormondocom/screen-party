@@ -14,7 +14,6 @@
 
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
-use std::time::Duration;
 
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
@@ -61,9 +60,10 @@ impl CpalLoopbackCapturer {
 
 impl AudioCapturer for CpalLoopbackCapturer {
     /// Block until a 20 ms frame of interleaved f32 samples is available.
+    /// Returns Err only when the audio thread has exited (channel closed).
     fn next_frame(&mut self) -> Result<AudioFrame, AudioError> {
         self.receiver
-            .recv_timeout(Duration::from_secs(5))
+            .recv()
             .map_err(|e| AudioError::Backend(e.to_string()))
     }
 
@@ -188,9 +188,19 @@ fn extend_f32(data: &Data, out: &mut Vec<f32>) {
                 out.extend_from_slice(s);
             }
         }
+        SampleFormat::F64 => {
+            if let Some(s) = data.as_slice::<f64>() {
+                out.extend(s.iter().map(|&v| v as f32));
+            }
+        }
         SampleFormat::I16 => {
             if let Some(s) = data.as_slice::<i16>() {
                 out.extend(s.iter().map(|&v| v as f32 / i16::MAX as f32));
+            }
+        }
+        SampleFormat::I32 => {
+            if let Some(s) = data.as_slice::<i32>() {
+                out.extend(s.iter().map(|&v| v as f32 / i32::MAX as f32));
             }
         }
         SampleFormat::U16 => {
@@ -198,6 +208,11 @@ fn extend_f32(data: &Data, out: &mut Vec<f32>) {
                 out.extend(s.iter().map(|&v| (v as f32 - 32_768.0) / 32_768.0));
             }
         }
-        _ => {} // unsupported format — skip silently
+        SampleFormat::U32 => {
+            if let Some(s) = data.as_slice::<u32>() {
+                out.extend(s.iter().map(|&v| (v as f32 - 2_147_483_648.0) / 2_147_483_648.0));
+            }
+        }
+        _ => {}
     }
 }
