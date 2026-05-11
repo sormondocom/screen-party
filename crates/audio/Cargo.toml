@@ -1,0 +1,8 @@
+[package]
+name = "audio"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+cpal = "0.15"
