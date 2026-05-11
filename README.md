@@ -1,9 +1,11 @@
 # Screen Party
 
-[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support%20the%20project-yellow?logo=buy-me-a-coffee)](https://buymeacoffee.com/sormondocom)
-
 <p align="center">
   <img src="assets/mascot.svg" alt="Screen Party mascot — an angel with laser eyes broadcasting to Earth" width="320"/>
+</p>
+
+<p align="center">
+  <a href="https://buymeacoffee.com/sormondocom"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support%20the%20project-yellow?logo=buy-me-a-coffee" alt="Buy Me a Coffee"/></a>
 </p>
 
 **Free, secure, self-hosted screen and audio sharing.**
