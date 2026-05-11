@@ -1,8 +1,10 @@
 //! Client-side rendering window: video display, chat overlay, disconnect menu.
 
+use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use font8x8::UnicodeFonts;
 use softbuffer::{Context, Surface};
@@ -19,6 +21,7 @@ use audio::CpalPlayer;
 
 use crate::identity;
 use crate::net::client::{run_network, ClientEvent, ClientSend};
+use crate::net::proto::DecodedFrame;
 
 // ── Layout constants ──────────────────────────────────────────────────────────
 
@@ -28,6 +31,14 @@ const CHAT_LINES:  usize = 6;
 const CHAT_PAD:    u32 = 8;
 // panel height: top_pad + id header + history rows + gap + input row + bottom_pad
 const CHAT_HEIGHT: u32 = CHAT_PAD * 2 + (CHAT_LINES as u32 + 2) * CHAR_H + 4;
+
+// Playback buffer: hold this many decoded frames before starting display.
+// At 30 fps, 15 frames ≈ 500 ms of pre-roll — enough to absorb typical
+// internet jitter without a noticeable startup gap.
+const VIDEO_PREBUFFER_FRAMES: usize = 15;
+// Hard ceiling on the decode queue. Frames beyond this are dropped
+// oldest-first so the viewer stays within ~4 s of live content.
+const VIDEO_MAX_QUEUE: usize = 120;
 
 const COLOR_BG:     u32 = 0x00_1A_1A_2E;
 const COLOR_TEXT:   u32 = 0x00_E0_E0_E0;
@@ -45,6 +56,11 @@ struct ClientApp {
     stream_h:     u32,
     video_buf:    Vec<u32>, // 0x00RRGGBB, stream_w * stream_h pixels
     audio_out:    Option<CpalPlayer>,
+    // Video playback buffer
+    video_queue:     VecDeque<DecodedFrame>,
+    playback_fps:    u8,
+    next_frame_due:  Instant,
+    prebuffering:    bool,
     // Identity
     client_fp:    String,
     host_fp:      String,
@@ -71,28 +87,97 @@ impl ClientApp {
         Self {
             event_rx,
             send_tx,
-            stream_w:     0,
-            stream_h:     0,
-            video_buf:    Vec::new(),
-            audio_out:    None,
+            stream_w:        0,
+            stream_h:        0,
+            video_buf:       Vec::new(),
+            audio_out:       None,
+            video_queue:     VecDeque::new(),
+            playback_fps:    30,
+            next_frame_due:  Instant::now(),
+            prebuffering:    true,
             client_fp,
-            host_fp:      String::new(),
-            host_trusted: None,
-            chat_history: Vec::new(),
-            chat_input:   String::new(),
-            menu_open:    false,
-            tick:         0,
-            disconnected: false,
-            surface:      None,
-            context:      None,
-            window:       None,
+            host_fp:         String::new(),
+            host_trusted:    None,
+            chat_history:    Vec::new(),
+            chat_input:      String::new(),
+            menu_open:       false,
+            tick:            0,
+            disconnected:    false,
+            surface:         None,
+            context:         None,
+            window:          None,
         }
+    }
+
+    // Apply a decoded frame's dirty rects to video_buf.
+    fn blit_frame(&mut self, frame: &DecodedFrame) {
+        if self.stream_w != frame.width || self.stream_h != frame.height {
+            self.stream_w = frame.width;
+            self.stream_h = frame.height;
+            self.video_buf = vec![0u32; (frame.width * frame.height) as usize];
+            if let Some(w) = &self.window {
+                let _ = w.request_inner_size(
+                    winit::dpi::PhysicalSize::new(frame.width, frame.height),
+                );
+            }
+        }
+        for rect in &frame.rects {
+            for (i, row_px) in rect.pixels.chunks(rect.w as usize * 4).enumerate() {
+                let ry = rect.y as usize + i;
+                if ry >= self.stream_h as usize { break; }
+                let base = ry * self.stream_w as usize + rect.x as usize;
+                for (j, px) in row_px.chunks(4).enumerate() {
+                    let idx = base + j;
+                    if idx < self.video_buf.len() {
+                        self.video_buf[idx] = rgba_to_xrgb(px[0], px[1], px[2]);
+                    }
+                }
+            }
+        }
+    }
+
+    // Pop one frame from the playback queue if it is due, blit it, and request
+    // a redraw.  Called every about_to_wait tick.
+    //
+    // Behaviour:
+    //   • Prebuffering: holds display until VIDEO_PREBUFFER_FRAMES have
+    //     accumulated, absorbing initial network jitter before first paint.
+    //   • Normal: one frame per 1/fps seconds; clock advances on each blit.
+    //   • Underrun (queue empty): last frame stays on screen; clock pauses
+    //     so playback resumes from where it froze, not a burst catch-up.
+    //   • Overrun (> VIDEO_MAX_QUEUE): drain_events already drops oldest.
+    fn advance_video(&mut self) {
+        if self.prebuffering {
+            if self.video_queue.len() < VIDEO_PREBUFFER_FRAMES {
+                return;
+            }
+            self.prebuffering = false;
+            self.next_frame_due = Instant::now();
+        }
+
+        let now = Instant::now();
+        if now < self.next_frame_due {
+            return;
+        }
+
+        if let Some(frame) = self.video_queue.pop_front() {
+            let frame_dur = Duration::from_nanos(
+                1_000_000_000 / self.playback_fps.max(1) as u64,
+            );
+            self.blit_frame(&frame);
+            self.next_frame_due = now + frame_dur;
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+        // Queue empty → clock stays at next_frame_due; next arriving frame
+        // will be shown immediately rather than causing a burst.
     }
 
     fn drain_events(&mut self) {
         while let Ok(ev) = self.event_rx.try_recv() {
             match ev {
-                ClientEvent::StreamInfo { width, height, sample_rate, channels, buffer_ms, .. } => {
+                ClientEvent::StreamInfo { width, height, fps, sample_rate, channels, buffer_ms } => {
                     // Only resize the video buffer if dims are non-zero.
                     // Clients that connected before the host selected a region
                     // will get zeros here and rely on VideoFrame lazy init instead.
@@ -106,6 +191,10 @@ impl ClientApp {
                             );
                         }
                     }
+                    // Reset the playback buffer for the new stream.
+                    self.playback_fps = fps.max(1);
+                    self.video_queue.clear();
+                    self.prebuffering = true;
                     // Open audio output pre-buffered to absorb the measured jitter.
                     let prebuf = (sample_rate as u64 * channels as u64 * buffer_ms / 1000) as usize;
                     match CpalPlayer::new(sample_rate, channels, prebuf) {
@@ -115,30 +204,13 @@ impl ClientApp {
                 }
 
                 ClientEvent::VideoFrame(frame) => {
-                    // Reallocate if dims changed (first frame, or host reselected region).
-                    if self.stream_w != frame.width || self.stream_h != frame.height {
-                        self.stream_w = frame.width;
-                        self.stream_h = frame.height;
-                        self.video_buf = vec![0u32; (frame.width * frame.height) as usize];
+                    // Drop the oldest frame if the queue is at its hard ceiling,
+                    // keeping the viewer within VIDEO_MAX_QUEUE frames of live.
+                    if self.video_queue.len() >= VIDEO_MAX_QUEUE {
+                        self.video_queue.pop_front();
                     }
-                    for rect in &frame.rects {
-                        for (i, row_px) in
-                            rect.pixels.chunks(rect.w as usize * 4).enumerate()
-                        {
-                            let ry = rect.y as usize + i;
-                            if ry >= self.stream_h as usize { break; }
-                            let base = ry * self.stream_w as usize + rect.x as usize;
-                            for (j, px) in row_px.chunks(4).enumerate() {
-                                let idx = base + j;
-                                if idx < self.video_buf.len() {
-                                    self.video_buf[idx] = rgba_to_xrgb(px[0], px[1], px[2]);
-                                }
-                            }
-                        }
-                    }
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
+                    self.video_queue.push_back(frame);
+                    // Blitting and redraw are handled by advance_video in about_to_wait.
                 }
 
                 ClientEvent::AudioChunk(samples) => {
@@ -293,6 +365,7 @@ impl ApplicationHandler for ClientApp {
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         self.tick += 1;
         self.drain_events();
+        self.advance_video();
 
         if self.disconnected {
             el.exit();

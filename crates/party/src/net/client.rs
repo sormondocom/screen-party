@@ -15,6 +15,7 @@ pub enum ClientEvent {
     StreamInfo {
         width:       u32,
         height:      u32,
+        fps:         u8,
         sample_rate: u32,
         channels:    u16,
         buffer_ms:   u64,
@@ -169,6 +170,7 @@ pub fn run_network(
     let _ = event_tx.send(ClientEvent::StreamInfo {
         width:       info.width,
         height:      info.height,
+        fps:         info.fps,
         sample_rate: info.sample_rate,
         channels:    info.channels as u16,
         buffer_ms:   stats.recommended_buffer_ms(),
