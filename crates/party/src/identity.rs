@@ -189,6 +189,36 @@ pub fn interactive_key_confirm(host: &str, fingerprint: &str) -> io::Result<bool
     Ok(answer.trim().eq_ignore_ascii_case("yes"))
 }
 
+/// Load the existing identity fingerprint, or silently generate a new one
+/// using the OS username as the nickname and no passphrase.  Always returns a
+/// non-empty string (falls back to empty only if both steps fail).
+pub fn ensure_identity() -> String {
+    if let Some(fp) = load_fingerprint() {
+        return fp;
+    }
+    let nickname = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "viewer".to_string());
+    let passphrase = Zeroizing::new(String::new());
+    match PgpIdentity::generate(&nickname, passphrase) {
+        Ok(id) => {
+            let path = identity_path();
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(armored) = id.secret_key_armored() {
+                let _ = std::fs::write(&path, armored);
+            }
+            eprintln!("[identity] generated new identity: {}", id.fingerprint);
+            id.fingerprint.clone()
+        }
+        Err(e) => {
+            eprintln!("[identity] auto-generate failed: {e}");
+            String::new()
+        }
+    }
+}
+
 // ── Known hosts ───────────────────────────────────────────────────────────────
 
 pub enum KnownHostStatus {

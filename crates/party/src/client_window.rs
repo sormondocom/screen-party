@@ -367,7 +367,7 @@ impl ApplicationHandler for ClientApp {
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub fn run(host: &str, port: u16, name: Option<String>) {
-    let client_fp = identity::load_fingerprint().unwrap_or_default();
+    let client_fp = identity::ensure_identity();
     let (event_tx, event_rx) = mpsc::channel::<ClientEvent>();
     let (send_tx, send_rx)   = mpsc::channel::<ClientSend>();
 

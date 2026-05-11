@@ -343,7 +343,6 @@ impl App {
 
     fn enter_capturing(&mut self, el: &ActiveEventLoop, region: Rect) {
         self.create_overlay_window(el, region);
-        self.create_chat_window(el);
 
         // Advertise real capture dimensions to connecting clients.
         if let Some(b) = &self.broadcaster {
@@ -401,7 +400,6 @@ impl App {
     }
 
     fn enter_selecting(&mut self, el: &ActiveEventLoop) {
-        self.destroy_chat_window();
         self.chat_input.clear();
 
         // Capture stopped — reset dims so clients connecting mid-select get zeros.
@@ -541,8 +539,10 @@ fn draw_str(buf: &mut [u32], stride: u32, x: u32, y: u32, s: &str, color: u32) {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
-        // Called once at startup — create the initial selector window.
+        // Called once at startup — create both windows immediately so JOIN
+        // notifications are visible even before the host selects a region.
         self.create_selector_window(el);
+        self.create_chat_window(el);
     }
 
     fn exiting(&mut self, _el: &ActiveEventLoop) {

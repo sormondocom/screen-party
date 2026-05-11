@@ -216,6 +216,8 @@ fn run_client(
     stream:      TcpStream,
     broadcaster: &Arc<Broadcaster>,
 ) -> io::Result<()> {
+    sys_notify(&broadcaster.chat_notify, format!("[CONN] {addr} is connecting…"));
+
     // `read_stream` is the read half; `stream` is kept for writes and set_read_timeout.
     let read_stream = stream.try_clone()?;
 
@@ -275,10 +277,8 @@ fn run_client(
     }
 
     // ── Approval gate ─────────────────────────────────────────────────────────
-    sys_notify(
-        &broadcaster.chat_notify,
-        format!("[JOIN] {display_name}  →  /approve {fp8}  or  /deny {fp8} [reason]"),
-    );
+    sys_notify(&broadcaster.chat_notify, format!("[JOIN] {display_name}  fp: {client_fp}"));
+    sys_notify(&broadcaster.chat_notify, format!("  → /approve {fp8}  or  /deny {fp8}"));
 
     let (dtx, drx) = mpsc::sync_channel::<ApprovalDecision>(1);
     broadcaster.pending.lock().unwrap().push(PendingEntry {
