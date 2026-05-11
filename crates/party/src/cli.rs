@@ -32,5 +32,8 @@ pub enum Mode {
         /// Interactively confirm the host's key fingerprint before connecting
         #[arg(short, long)]
         interactive: bool,
+        /// Display name shown to the host and in chat (e.g. "Alice")
+        #[arg(short, long)]
+        name: Option<String>,
     },
 }

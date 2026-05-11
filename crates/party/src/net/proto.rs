@@ -10,7 +10,7 @@ use std::io::{self, Read, Write};
 
 use capture::{Frame, Rect};
 
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 
 /// Total bytes sent per speed probe pass.
 pub const PROBE_BYTES: usize = 2 * 1024 * 1024; // 2 MB
@@ -56,59 +56,94 @@ pub fn read_msg(r: &mut impl Read) -> io::Result<(u8, Vec<u8>)> {
 
 // ── Handshake (host → client) ─────────────────────────────────────────────────
 
-pub fn encode_handshake(interactive_required: bool, fingerprint: &str) -> Vec<u8> {
+/// Encode the HANDSHAKE message.
+/// Layout: [version u8][interactive u8][fp_len u16][fp bytes][pubkey 32 bytes]
+pub fn encode_handshake(interactive_required: bool, fingerprint: &str, pubkey: &[u8; 32]) -> Vec<u8> {
     let fp = fingerprint.as_bytes();
-    let mut b = Vec::with_capacity(4 + fp.len());
+    let mut b = Vec::with_capacity(4 + fp.len() + 32);
     b.push(VERSION);
     b.push(interactive_required as u8);
     b.extend_from_slice(&(fp.len() as u16).to_le_bytes());
     b.extend_from_slice(fp);
+    b.extend_from_slice(pubkey);
     b
 }
 
 pub struct Handshake {
-    pub version: u8,
+    pub version:              u8,
     pub interactive_required: bool,
-    pub fingerprint: String,
+    pub fingerprint:          String,
+    pub pubkey:               [u8; 32],
 }
 
 pub fn decode_handshake(p: &[u8]) -> io::Result<Handshake> {
     if p.len() < 4 { return Err(bad("handshake too short")); }
     let fp_len = u16::from_le_bytes([p[2], p[3]]) as usize;
-    if p.len() < 4 + fp_len { return Err(bad("handshake truncated")); }
+    if p.len() < 4 + fp_len + 32 { return Err(bad("handshake truncated")); }
+    let mut pubkey = [0u8; 32];
+    pubkey.copy_from_slice(&p[4 + fp_len..4 + fp_len + 32]);
     Ok(Handshake {
-        version: p[0],
+        version:              p[0],
         interactive_required: p[1] != 0,
-        fingerprint: String::from_utf8(p[4..4 + fp_len].to_vec())
-            .map_err(|_| bad("bad fingerprint utf8"))?,
+        fingerprint:          String::from_utf8(p[4..4 + fp_len].to_vec())
+                                  .map_err(|_| bad("bad fingerprint utf8"))?,
+        pubkey,
     })
 }
 
 // ── Handshake ACK (client → host) ────────────────────────────────────────────
 
-pub fn encode_ack(interactive_confirmed: bool, fingerprint: &str) -> Vec<u8> {
+/// Encode the HANDSHAKE_ACK message.
+/// Layout: [interactive u8][fp_len u16][fp bytes][pubkey 32 bytes][name_len u16][name bytes]
+pub fn encode_ack(interactive_confirmed: bool, fingerprint: &str, pubkey: &[u8; 32], name: &str) -> Vec<u8> {
     let fp = fingerprint.as_bytes();
-    let mut b = Vec::with_capacity(3 + fp.len());
+    let nm = name.as_bytes();
+    let mut b = Vec::with_capacity(3 + fp.len() + 32 + 2 + nm.len());
     b.push(interactive_confirmed as u8);
     b.extend_from_slice(&(fp.len() as u16).to_le_bytes());
     b.extend_from_slice(fp);
+    b.extend_from_slice(pubkey);
+    b.extend_from_slice(&(nm.len() as u16).to_le_bytes());
+    b.extend_from_slice(nm);
     b
 }
 
 pub struct Ack {
     pub interactive_confirmed: bool,
-    pub fingerprint: String,
+    pub fingerprint:           String,
+    pub pubkey:                [u8; 32],
+    pub name:                  String,
 }
 
 pub fn decode_ack(p: &[u8]) -> io::Result<Ack> {
     if p.len() < 3 { return Err(bad("ack too short")); }
     let fp_len = u16::from_le_bytes([p[1], p[2]]) as usize;
-    if p.len() < 3 + fp_len { return Err(bad("ack truncated")); }
+    if p.len() < 3 + fp_len + 32 + 2 { return Err(bad("ack truncated")); }
+    let mut pubkey = [0u8; 32];
+    pubkey.copy_from_slice(&p[3 + fp_len..3 + fp_len + 32]);
+    let name_off = 3 + fp_len + 32;
+    let name_len = u16::from_le_bytes([p[name_off], p[name_off + 1]]) as usize;
+    if p.len() < name_off + 2 + name_len { return Err(bad("ack name truncated")); }
     Ok(Ack {
         interactive_confirmed: p[0] != 0,
-        fingerprint: String::from_utf8(p[3..3 + fp_len].to_vec())
-            .map_err(|_| bad("bad ack fingerprint utf8"))?,
+        fingerprint:           String::from_utf8(p[3..3 + fp_len].to_vec())
+                                   .map_err(|_| bad("bad ack fingerprint utf8"))?,
+        pubkey,
+        name:                  String::from_utf8(p[name_off + 2..name_off + 2 + name_len].to_vec())
+                                   .map_err(|_| bad("bad ack name utf8"))?,
     })
+}
+
+/// Build the chat display name shown to all participants.
+/// Format: `"Name [fp6]"` when both are present, `"Name"` or `"fp6"` otherwise.
+pub fn make_display_name(name: &str, fingerprint: &str) -> String {
+    let fp6 = fingerprint.get(..6).unwrap_or(fingerprint);
+    match (name.is_empty(), fp6.is_empty()) {
+        (false, false) => format!("{name} [{fp6}]"),
+        (false, true)  => name.to_string(),
+        (true,  false) => fp6.to_string(),
+        (true,  true)  => "unknown".to_string(),
+    }
 }
 
 // ── Speed report (client → host) ─────────────────────────────────────────────

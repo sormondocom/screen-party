@@ -644,8 +644,8 @@ fn main() {
             run_host_gui(port, interactive);
         }
 
-        cli::Mode::Client { host, port, interactive } => {
-            client_window::run(&host, port, interactive);
+        cli::Mode::Client { host, port, interactive, name } => {
+            client_window::run(&host, port, interactive, name);
         }
     }
 }

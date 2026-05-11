@@ -327,7 +327,7 @@ impl ApplicationHandler for ClientApp {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-pub fn run(host: &str, port: u16, interactive: bool) {
+pub fn run(host: &str, port: u16, interactive: bool, name: Option<String>) {
     let client_fp = identity::load_fingerprint().unwrap_or_default();
     let (event_tx, event_rx) = mpsc::channel::<ClientEvent>();
     let (send_tx, send_rx)   = mpsc::channel::<ClientSend>();
@@ -338,7 +338,7 @@ pub fn run(host: &str, port: u16, interactive: bool) {
         .name("net-client".into())
         .spawn(move || {
             if let Err(e) =
-                run_network(host_owned, port, interactive, fp_owned, event_tx, send_rx)
+                run_network(host_owned, port, interactive, fp_owned, name, event_tx, send_rx)
             {
                 eprintln!("[net] {e}");
             }

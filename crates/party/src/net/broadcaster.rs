@@ -1,12 +1,12 @@
 //! Host-side broadcaster: TCP listener + one-to-many fan-out.
 //!
 //! Each connecting client goes through:
-//!   1. Handshake  — version check, interactive enforcement
-//!   2. Speed test — host sends probe, client reports stats
-//!   3. STREAM_INFO — codec/format metadata
+//!   1. Handshake  — version check, X25519 key exchange, interactive enforcement
+//!   2. Speed test — host sends probe, client reports stats  (encrypted)
+//!   3. STREAM_INFO — codec/format metadata                  (encrypted)
 //!   4. Split threads:
-//!      • Send loop  — BroadcastMsgs → socket  (main client thread)
-//!      • Read loop  — incoming CHAT_MSG → re-broadcast to all  (spawned thread)
+//!      • Send loop  — BroadcastMsgs → socket  (main client thread, encrypted)
+//!      • Read loop  — incoming CHAT_MSG → re-broadcast to all  (spawned, encrypted)
 
 use std::io::{self, BufReader, BufWriter};
 use std::net::{TcpListener, TcpStream};
@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use capture::{Frame, Rect};
 
+use super::cipher::{EncryptedReader, EncryptedWriter, EphemeralKeypair, Role};
 use super::{proto, speed_test};
 
 // ── Public message type ───────────────────────────────────────────────────────
@@ -155,27 +156,40 @@ fn run_client(
     stream:      TcpStream,
     broadcaster: &Arc<Broadcaster>,
 ) -> io::Result<()> {
-    // Clone the stream so the read thread and write thread each own a handle.
+    // `read_stream` is the read half; `stream` is kept for writes and set_read_timeout.
     let read_stream = stream.try_clone()?;
-    let mut r = BufReader::new(read_stream);
-    let mut w = BufWriter::new(&stream);
 
     stream.set_read_timeout(Some(Duration::from_secs(15)))?;
 
-    // ── Handshake ─────────────────────────────────────────────────────────────
+    // ── Plaintext handshake ───────────────────────────────────────────────────
+    // Use raw &stream / &read_stream (no BufReader) to avoid pre-fetching bytes
+    // that belong to the first encrypted record.
+    let kp = EphemeralKeypair::generate();
+
     proto::write_msg(
-        &mut w,
+        &mut &stream,
         proto::msg::HANDSHAKE,
-        &proto::encode_handshake(broadcaster.interactive, &broadcaster.host_fingerprint),
+        &proto::encode_handshake(
+            broadcaster.interactive,
+            &broadcaster.host_fingerprint,
+            &kp.public_bytes,
+        ),
     )?;
 
-    let (ty, payload) = proto::read_msg(&mut r)?;
+    let (ty, payload) = proto::read_msg(&mut &read_stream)?;
     if ty == proto::msg::DISCONNECT { return Ok(()); }
     if ty != proto::msg::HANDSHAKE_ACK {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "expected HANDSHAKE_ACK"));
     }
 
     let ack = proto::decode_ack(&payload)?;
+
+    // Derive session cipher from the completed key exchange.
+    let keys = kp.complete(&ack.pubkey, Role::Host);
+
+    // Switch to encrypted I/O for all subsequent messages.
+    let mut r = BufReader::new(EncryptedReader::new(read_stream, keys.recv));
+    let mut w = BufWriter::new(EncryptedWriter::new(&stream, keys.send));
 
     if broadcaster.interactive && !ack.interactive_confirmed {
         proto::write_msg(&mut w, proto::msg::HANDSHAKE_REJECT, b"interactive confirmation required")?;
@@ -185,14 +199,13 @@ fn run_client(
         ));
     }
 
-    // Use the first 8 chars of the fingerprint as the chat display name.
-    let display_name = ack.fingerprint.get(..8).unwrap_or(&ack.fingerprint).to_string();
+    let display_name = proto::make_display_name(&ack.name, &ack.fingerprint);
     println!(
         "[net] client {id} OK  name={}  interactive={}",
         display_name, ack.interactive_confirmed,
     );
 
-    // ── Speed test ────────────────────────────────────────────────────────────
+    // ── Speed test (encrypted) ────────────────────────────────────────────────
     stream.set_read_timeout(Some(Duration::from_secs(60)))?;
     println!("[net] client {id} speed probe…");
     let stats = speed_test::host_send_probe(&mut r, &mut w)?;
@@ -201,7 +214,7 @@ fn run_client(
         eprintln!("[net] WARNING: client {id} ({addr}) connection is unstable");
     }
 
-    // ── Stream info ───────────────────────────────────────────────────────────
+    // ── Stream info (encrypted) ───────────────────────────────────────────────
     let (sw, sh, sfps) = *broadcaster.stream_dims.lock().unwrap();
     proto::write_msg(
         &mut w,
@@ -215,16 +228,16 @@ fn run_client(
     stream.set_read_timeout(None)?;
     println!("[net] client {id} ({addr}) streaming");
 
-    // Read thread: handles incoming CHAT_MSG from this client and relays to all.
+    // Read thread: handles incoming CHAT_MSG from this client (encrypted).
     let clients_for_read = broadcaster.clients.clone();
     let chat_notify      = broadcaster.chat_notify.clone();
-    let read_inner = r.into_inner(); // recover the cloned TcpStream
+    let enc_reader = r.into_inner(); // BufReader → EncryptedReader<TcpStream>
     std::thread::Builder::new()
         .name(format!("client-{id}-read"))
-        .spawn(move || client_read_loop(id, display_name, read_inner, clients_for_read, chat_notify))
+        .spawn(move || client_read_loop(id, display_name, enc_reader, clients_for_read, chat_notify))
         .ok();
 
-    // Send loop: fan-out messages to this client's socket.
+    // Send loop: fan-out encrypted messages to this client's socket.
     for msg in rx {
         match msg.as_ref() {
             BroadcastMsg::VideoFrame { rects, frame } => {
@@ -257,11 +270,11 @@ fn run_client(
 fn client_read_loop(
     id:          u64,
     _name:       String,
-    stream:      TcpStream,
+    enc_reader:  EncryptedReader<TcpStream>,
     clients:     Arc<Mutex<Vec<ClientHandle>>>,
     chat_notify: Arc<Mutex<Option<mpsc::Sender<(String, String)>>>>,
 ) {
-    let mut r = BufReader::new(&stream);
+    let mut r = BufReader::new(enc_reader);
     loop {
         let (ty, payload) = match proto::read_msg(&mut r) {
             Ok(m) => m,

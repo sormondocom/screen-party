@@ -1,10 +1,11 @@
-//! Client-side network driver: handshake, speed probe, streaming receive loop.
+//! Client-side network driver: handshake, key exchange, speed probe, streaming receive loop.
 
 use std::io::{self, BufReader, BufWriter};
 use std::net::TcpStream;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use super::cipher::{EncryptedReader, EncryptedWriter, EphemeralKeypair, Role};
 use super::{proto, speed_test};
 use crate::identity;
 
@@ -34,35 +35,49 @@ pub enum ClientSend {
 
 /// Run the full client network loop in the calling thread.
 ///
-/// Performs handshake + speed probe, then:
-///  • Spawns a write thread draining `send_rx` → socket.
-///  • Reads video / chat / disconnect messages and forwards them via `event_tx`.
+/// Performs handshake + key exchange + speed probe, then:
+///  • Spawns a write thread draining `send_rx` → socket (encrypted).
+///  • Reads video / chat / disconnect messages via encrypted I/O.
 pub fn run_network(
     host:               String,
     port:               u16,
     interactive:        bool,
     client_fingerprint: String,
+    name:               Option<String>,
     event_tx:           mpsc::Sender<ClientEvent>,
     send_rx:            mpsc::Receiver<ClientSend>,
 ) -> io::Result<()> {
     println!("[net] connecting to {host}:{port}…");
-    let stream = TcpStream::connect((host.as_str(), port))?;
-    let _ = stream.set_nodelay(true);
-    let write_stream = stream.try_clone()?;
-    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
 
-    let mut r = BufReader::new(stream);
-    let mut w = BufWriter::new(write_stream);
+    // `ctrl` is kept for set_read_timeout calls; rstrm/wstrm own the socket I/O.
+    let ctrl  = TcpStream::connect((host.as_str(), port))?;
+    let _ = ctrl.set_nodelay(true);
+    let rstrm = ctrl.try_clone()?;
+    let wstrm = ctrl.try_clone()?;
 
-    // ── Handshake ─────────────────────────────────────────────────────────────
-    let (ty, payload) = proto::read_msg(&mut r)?;
+    ctrl.set_read_timeout(Some(Duration::from_secs(15)))?;
+
+    // Sanitize the name: printable chars only, max 32 characters.
+    let clean_name: String = name
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(32)
+        .collect();
+
+    let kp = EphemeralKeypair::generate();
+
+    // ── Plaintext handshake ───────────────────────────────────────────────────
+    // Use raw references (no BufReader) so we don't pre-fetch bytes that
+    // belong to the first encrypted record.
+    let (ty, payload) = proto::read_msg(&mut &rstrm)?;
     if ty != proto::msg::HANDSHAKE {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "expected HANDSHAKE"));
     }
     let hs = proto::decode_handshake(&payload)?;
 
     if hs.version != proto::VERSION {
-        proto::write_msg(&mut w, proto::msg::DISCONNECT, b"version mismatch")?;
+        proto::write_msg(&mut &wstrm, proto::msg::DISCONNECT, b"version mismatch")?;
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("version mismatch: host={} us={}", hs.version, proto::VERSION),
@@ -72,7 +87,7 @@ pub fn run_network(
     let interactive_confirmed = if hs.interactive_required {
         if !interactive {
             eprintln!("Host requires --interactive. Re-run with --interactive.");
-            proto::write_msg(&mut w, proto::msg::DISCONNECT, b"interactive required")?;
+            proto::write_msg(&mut &wstrm, proto::msg::DISCONNECT, b"interactive required")?;
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "host requires interactive confirmation",
@@ -81,7 +96,7 @@ pub fn run_network(
         match identity::interactive_key_confirm(&host, &hs.fingerprint) {
             Ok(true) => true,
             Ok(false) => {
-                proto::write_msg(&mut w, proto::msg::DISCONNECT, b"user declined")?;
+                proto::write_msg(&mut &wstrm, proto::msg::DISCONNECT, b"user declined")?;
                 println!("Connection declined.");
                 return Ok(());
             }
@@ -92,21 +107,29 @@ pub fn run_network(
     };
 
     proto::write_msg(
-        &mut w,
+        &mut &wstrm,
         proto::msg::HANDSHAKE_ACK,
-        &proto::encode_ack(interactive_confirmed, &client_fingerprint),
+        &proto::encode_ack(interactive_confirmed, &client_fingerprint, &kp.public_bytes, &clean_name),
     )?;
 
-    // ── Speed probe ───────────────────────────────────────────────────────────
-    r.get_ref().set_read_timeout(Some(Duration::from_secs(60)))?;
+    // ── Derive session cipher ─────────────────────────────────────────────────
+    let keys = kp.complete(&hs.pubkey, Role::Client);
+
+    // ── Switch to encrypted I/O ───────────────────────────────────────────────
+    ctrl.set_read_timeout(Some(Duration::from_secs(60)))?;
     println!("[net] running speed test…");
+
+    let mut r = BufReader::new(EncryptedReader::new(rstrm, keys.recv));
+    let mut w = BufWriter::new(EncryptedWriter::new(wstrm, keys.send));
+
+    // ── Speed probe (encrypted) ───────────────────────────────────────────────
     let stats = speed_test::client_receive_probe(&mut r, &mut w)?;
     stats.log("downstream");
     if !stats.is_stable() {
         eprintln!("WARNING: connection is unstable — video may stutter");
     }
 
-    // ── Stream info ───────────────────────────────────────────────────────────
+    // ── Stream info (encrypted) ───────────────────────────────────────────────
     let (ty, payload) = proto::read_msg(&mut r)?;
     if ty == proto::msg::HANDSHAKE_REJECT {
         let reason = String::from_utf8_lossy(&payload).into_owned();
@@ -135,11 +158,8 @@ pub fn run_network(
     });
 
     // ── Split write thread ────────────────────────────────────────────────────
-    r.get_ref().set_read_timeout(None)?;
-    let display_name = client_fingerprint
-        .get(..8)
-        .unwrap_or(&client_fingerprint)
-        .to_string();
+    ctrl.set_read_timeout(None)?;
+    let display_name = proto::make_display_name(&clean_name, &client_fingerprint);
 
     std::thread::Builder::new()
         .name("net-write".into())
@@ -163,7 +183,7 @@ pub fn run_network(
         })
         .ok();
 
-    // ── Read loop ─────────────────────────────────────────────────────────────
+    // ── Read loop (encrypted) ─────────────────────────────────────────────────
     loop {
         let (ty, payload) = match proto::read_msg(&mut r) {
             Ok(m) => m,
