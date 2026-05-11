@@ -32,10 +32,6 @@ const CHAT_PAD:    u32 = 8;
 // panel height: top_pad + id header + history rows + gap + input row + bottom_pad
 const CHAT_HEIGHT: u32 = CHAT_PAD * 2 + (CHAT_LINES as u32 + 2) * CHAR_H + 4;
 
-// Playback buffer: hold this many decoded frames before starting display.
-// At 30 fps, 15 frames ≈ 500 ms of pre-roll — enough to absorb typical
-// internet jitter without a noticeable startup gap.
-const VIDEO_PREBUFFER_FRAMES: usize = 15;
 // Hard ceiling on the decode queue. Frames beyond this are dropped
 // oldest-first so the viewer stays within ~4 s of live content.
 const VIDEO_MAX_QUEUE: usize = 120;
@@ -57,10 +53,11 @@ struct ClientApp {
     video_buf:    Vec<u32>, // 0x00RRGGBB, stream_w * stream_h pixels
     audio_out:    Option<CpalPlayer>,
     // Video playback buffer
-    video_queue:     VecDeque<DecodedFrame>,
-    playback_fps:    u8,
-    next_frame_due:  Instant,
-    prebuffering:    bool,
+    video_queue:      VecDeque<DecodedFrame>,
+    playback_fps:     u8,
+    next_frame_due:   Instant,
+    prebuffering:     bool,
+    prebuffer_target: usize, // frames to accumulate before first display (from speed-test)
     // Identity
     client_fp:    String,
     host_fp:      String,
@@ -91,10 +88,11 @@ impl ClientApp {
             stream_h:        0,
             video_buf:       Vec::new(),
             audio_out:       None,
-            video_queue:     VecDeque::new(),
-            playback_fps:    30,
-            next_frame_due:  Instant::now(),
-            prebuffering:    true,
+            video_queue:      VecDeque::new(),
+            playback_fps:     30,
+            next_frame_due:   Instant::now(),
+            prebuffering:     true,
+            prebuffer_target: 2,
             client_fp,
             host_fp:         String::new(),
             host_trusted:    None,
@@ -148,7 +146,7 @@ impl ClientApp {
     //   • Overrun (> VIDEO_MAX_QUEUE): drain_events already drops oldest.
     fn advance_video(&mut self) {
         if self.prebuffering {
-            if self.video_queue.len() < VIDEO_PREBUFFER_FRAMES {
+            if self.video_queue.len() < self.prebuffer_target {
                 return;
             }
             self.prebuffering = false;
@@ -165,13 +163,20 @@ impl ClientApp {
                 1_000_000_000 / self.playback_fps.max(1) as u64,
             );
             self.blit_frame(&frame);
-            self.next_frame_due = now + frame_dur;
+            // += keeps the deadline grid fixed regardless of when about_to_wait fires,
+            // preventing cumulative drift. The snap-forward guard prevents burst
+            // catch-up after an underrun: if we're still more than one frame behind
+            // after advancing, jump the clock to now so only one frame is shown early.
+            self.next_frame_due += frame_dur;
+            if self.next_frame_due + frame_dur < now {
+                self.next_frame_due = now;
+            }
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
         }
-        // Queue empty → clock stays at next_frame_due; next arriving frame
-        // will be shown immediately rather than causing a burst.
+        // Queue empty → clock stays frozen at next_frame_due so the next
+        // arriving frame shows immediately without a burst of catch-up frames.
     }
 
     fn drain_events(&mut self) {
@@ -195,6 +200,12 @@ impl ClientApp {
                     self.playback_fps = fps.max(1);
                     self.video_queue.clear();
                     self.prebuffering = true;
+                    // Size the prebuffer to absorb the measured link jitter:
+                    //   frames = ceil(buffer_ms * fps / 1000), clamped to [2, max/2].
+                    // On LAN (buffer_ms ≈ 5 ms, fps=30) → 1 → clamped to 2 frames (~67 ms).
+                    // On internet (buffer_ms ≈ 500 ms) → 15 frames (~500 ms).
+                    self.prebuffer_target = ((buffer_ms * self.playback_fps as u64 + 999) / 1000)
+                        .clamp(2, (VIDEO_MAX_QUEUE / 2) as u64) as usize;
                     // Open audio output pre-buffered to absorb the measured jitter.
                     let prebuf = (sample_rate as u64 * channels as u64 * buffer_ms / 1000) as usize;
                     match CpalPlayer::new(sample_rate, channels, prebuf) {
