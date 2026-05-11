@@ -42,7 +42,6 @@ pub enum ApprovalDecision {
 
 struct ClientHandle {
     id:          u64,
-    addr:        std::net::SocketAddr,
     name:        String,
     fingerprint: String,
     tx:          SyncSender<Arc<BroadcastMsg>>,
@@ -61,8 +60,6 @@ const QUEUE_DEPTH: usize = 30;
 // ── Broadcaster ───────────────────────────────────────────────────────────────
 
 pub struct Broadcaster {
-    interactive:      bool,
-    require_approval: bool,
     host_fingerprint: String,
     sample_rate:      u32,
     channels:         u16,
@@ -77,15 +74,11 @@ pub struct Broadcaster {
 
 impl Broadcaster {
     pub fn new(
-        interactive:      bool,
-        require_approval: bool,
         host_fingerprint: String,
         sample_rate:      u32,
         channels:         u16,
     ) -> Arc<Self> {
         Arc::new(Self {
-            interactive,
-            require_approval,
             host_fingerprint,
             sample_rate,
             channels,
@@ -115,10 +108,6 @@ impl Broadcaster {
             }
             Err(mpsc::TrySendError::Disconnected(_)) => false,
         });
-    }
-
-    pub fn client_count(&self) -> usize {
-        self.clients.lock().unwrap().len()
     }
 
     pub fn set_stream_dims(&self, width: u32, height: u32, fps: u8) {
@@ -239,7 +228,7 @@ fn run_client(
         &mut &stream,
         proto::msg::HANDSHAKE,
         &proto::encode_handshake(
-            broadcaster.interactive,
+            true, // interactive confirmation always required
             &broadcaster.host_fingerprint,
             &kp.public_bytes,
         ),
@@ -258,11 +247,11 @@ fn run_client(
     let mut r = BufReader::new(EncryptedReader::new(read_stream, keys.recv));
     let mut w = BufWriter::new(EncryptedWriter::new(&stream, keys.send));
 
-    if broadcaster.interactive && !ack.interactive_confirmed {
-        proto::write_msg(&mut w, proto::msg::HANDSHAKE_REJECT, b"interactive confirmation required")?;
+    if !ack.interactive_confirmed {
+        proto::write_msg(&mut w, proto::msg::HANDSHAKE_REJECT, b"fingerprint confirmation required")?;
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "client skipped interactive confirmation",
+            "client did not confirm host fingerprint",
         ));
     }
 
@@ -286,38 +275,33 @@ fn run_client(
     }
 
     // ── Approval gate ─────────────────────────────────────────────────────────
-    // Always notify the host that a client is at the door.
-    let join_hint = if broadcaster.require_approval {
-        format!("  →  /approve {fp8}  or  /deny {fp8} [reason]")
-    } else {
-        String::new()
-    };
-    sys_notify(&broadcaster.chat_notify, format!("[JOIN] {display_name}{join_hint}"));
+    sys_notify(
+        &broadcaster.chat_notify,
+        format!("[JOIN] {display_name}  →  /approve {fp8}  or  /deny {fp8} [reason]"),
+    );
 
-    if broadcaster.require_approval {
-        let (dtx, drx) = mpsc::sync_channel::<ApprovalDecision>(1);
-        broadcaster.pending.lock().unwrap().push(PendingEntry {
-            id,
-            name:        client_name.clone(),
-            fingerprint: client_fp.clone(),
-            decision_tx: dtx,
-        });
+    let (dtx, drx) = mpsc::sync_channel::<ApprovalDecision>(1);
+    broadcaster.pending.lock().unwrap().push(PendingEntry {
+        id,
+        name:        client_name.clone(),
+        fingerprint: client_fp.clone(),
+        decision_tx: dtx,
+    });
 
-        match drx.recv() {
-            Ok(ApprovalDecision::Approved) => {}
-            Ok(ApprovalDecision::Denied(reason)) => {
-                sys_notify(
-                    &broadcaster.chat_notify,
-                    format!("[DENIED] {display_name}: {reason}"),
-                );
-                proto::write_msg(&mut w, proto::msg::HANDSHAKE_REJECT, reason.as_bytes())?;
-                return Ok(());
-            }
-            Err(_) => {
-                // Broadcaster dropped (host quit) while client was pending.
-                proto::write_msg(&mut w, proto::msg::DISCONNECT, b"")?;
-                return Ok(());
-            }
+    match drx.recv() {
+        Ok(ApprovalDecision::Approved) => {}
+        Ok(ApprovalDecision::Denied(reason)) => {
+            sys_notify(
+                &broadcaster.chat_notify,
+                format!("[DENIED] {display_name}: {reason}"),
+            );
+            proto::write_msg(&mut w, proto::msg::HANDSHAKE_REJECT, reason.as_bytes())?;
+            return Ok(());
+        }
+        Err(_) => {
+            // Broadcaster dropped (host quit) while client was pending.
+            proto::write_msg(&mut w, proto::msg::DISCONNECT, b"")?;
+            return Ok(());
         }
     }
 
@@ -333,7 +317,6 @@ fn run_client(
     let (tx, rx) = mpsc::sync_channel::<Arc<BroadcastMsg>>(QUEUE_DEPTH);
     broadcaster.clients.lock().unwrap().push(ClientHandle {
         id,
-        addr,
         name:        client_name,
         fingerprint: client_fp,
         tx,

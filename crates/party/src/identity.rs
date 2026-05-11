@@ -12,7 +12,7 @@ use std::{
 use pgp::{
     composed::{
         key::{SecretKeyParamsBuilder, SubkeyParamsBuilder},
-        Deserializable, KeyType, SignedPublicKey, SignedSecretKey,
+        Deserializable, KeyType, SignedSecretKey,
     },
     crypto::{ecc_curve::ECCCurve, hash::HashAlgorithm, sym::SymmetricKeyAlgorithm},
     types::{CompressionAlgorithm, KeyTrait, SecretKeyTrait},
@@ -25,7 +25,6 @@ use zeroize::{Zeroize, Zeroizing};
 
 pub struct PgpIdentity {
     pub secret_key:  SignedSecretKey,
-    pub public_key:  SignedPublicKey,
     pub fingerprint: String,
     passphrase: Zeroizing<String>,
 }
@@ -41,7 +40,6 @@ impl PgpIdentity {
     pub fn generate(nickname: &str, passphrase: Zeroizing<String>) -> anyhow::Result<Self> {
         let user_id = format!("{} <{}@screen-party>", nickname, nickname.to_lowercase());
         let pw_sign = passphrase.clone();
-        let pw_pub  = passphrase.clone();
 
         let params = SecretKeyParamsBuilder::default()
             .key_type(KeyType::EdDSA)
@@ -66,34 +64,23 @@ impl PgpIdentity {
             .sign(move || pw_sign.as_str().to_owned())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let pub_key = signed_secret.public_key();
-        let signed_public = pub_key
-            .sign(&signed_secret, move || pw_pub.as_str().to_owned())
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let fingerprint = hex::encode(signed_secret.public_key().fingerprint());
 
-        let fingerprint = hex::encode(signed_public.fingerprint());
-
-        Ok(Self { secret_key: signed_secret, public_key: signed_public, fingerprint, passphrase })
+        Ok(Self { secret_key: signed_secret, fingerprint, passphrase })
     }
 
     /// Load from an ASCII-armoured secret key file.
     pub fn from_armored_file(path: &PathBuf, passphrase: Zeroizing<String>) -> anyhow::Result<Self> {
         use std::io::Cursor;
         let armored = std::fs::read_to_string(path)?;
-        let pw_pub  = passphrase.clone();
 
         let (signed_secret, _) =
             SignedSecretKey::from_armor_single(Cursor::new(armored.as_bytes()))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let pub_key = signed_secret.public_key();
-        let signed_public = pub_key
-            .sign(&signed_secret, move || pw_pub.as_str().to_owned())
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let fingerprint = hex::encode(signed_secret.public_key().fingerprint());
 
-        let fingerprint = hex::encode(signed_public.fingerprint());
-
-        Ok(Self { secret_key: signed_secret, public_key: signed_public, fingerprint, passphrase })
+        Ok(Self { secret_key: signed_secret, fingerprint, passphrase })
     }
 
     pub fn secret_key_armored(&self) -> anyhow::Result<String> {

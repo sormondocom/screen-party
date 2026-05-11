@@ -15,7 +15,6 @@ pub enum ClientEvent {
     StreamInfo {
         width:       u32,
         height:      u32,
-        fps:         u8,
         sample_rate: u32,
         channels:    u16,
         buffer_ms:   u64,
@@ -42,7 +41,6 @@ pub enum ClientSend {
 pub fn run_network(
     host:               String,
     port:               u16,
-    interactive:        bool,
     client_fingerprint: String,
     name:               Option<String>,
     event_tx:           mpsc::Sender<ClientEvent>,
@@ -100,37 +98,23 @@ pub fn run_network(
     }
     let already_trusted = matches!(host_trust, identity::KnownHostStatus::Trusted);
 
-    let interactive_confirmed = if hs.interactive_required {
-        if !interactive && !already_trusted {
-            eprintln!("Host requires --interactive. Re-run with --interactive.");
-            proto::write_msg(&mut &wstrm, proto::msg::DISCONNECT, b"interactive required")?;
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "host requires interactive confirmation",
-            ));
-        }
-        if already_trusted {
-            println!("[identity] known host — skipping confirmation prompt");
-            true
-        } else {
-            match identity::interactive_key_confirm(&host, &hs.fingerprint) {
-                Ok(true) => {
-                    let _ = identity::save_known_host(&host, port, &hs.fingerprint);
-                    true
-                }
-                Ok(false) => {
-                    proto::write_msg(&mut &wstrm, proto::msg::DISCONNECT, b"user declined")?;
-                    println!("Connection declined.");
-                    return Ok(());
-                }
-                Err(e) => return Err(e),
-            }
-        }
+    // Always confirm the host fingerprint — auto-accept known hosts, prompt for new ones.
+    let interactive_confirmed = if already_trusted {
+        println!("[identity] known host — skipping confirmation prompt");
+        true
     } else {
-        if !already_trusted {
-            let _ = identity::save_known_host(&host, port, &hs.fingerprint);
+        match identity::interactive_key_confirm(&host, &hs.fingerprint) {
+            Ok(true) => {
+                let _ = identity::save_known_host(&host, port, &hs.fingerprint);
+                true
+            }
+            Ok(false) => {
+                proto::write_msg(&mut &wstrm, proto::msg::DISCONNECT, b"user declined")?;
+                println!("Connection declined.");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
         }
-        false
     };
 
     proto::write_msg(
@@ -185,7 +169,6 @@ pub fn run_network(
     let _ = event_tx.send(ClientEvent::StreamInfo {
         width:       info.width,
         height:      info.height,
-        fps:         info.fps,
         sample_rate: info.sample_rate,
         channels:    info.channels as u16,
         buffer_ms:   stats.recommended_buffer_ms(),

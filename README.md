@@ -73,11 +73,8 @@ Type any of these in the host chat window and press Enter:
 ### 4. Host options
 
 ```
-party host --port 8888              # listen on a different port (default: 7777)
-party host --generate-key           # create or replace your PGP identity
-party host --interactive            # require clients to confirm your fingerprint before connecting
-party host --approve                # hold each client at the door until you /approve them
-party host --interactive --approve  # both: clients confirm your key, then you confirm theirs
+party host --port 8888    # listen on a different port (default: 7777)
+party host --generate-key # create or replace your PGP identity
 ```
 
 ---
@@ -117,8 +114,8 @@ You: abc123ef   Host: def456gh [known]
 ### 4. Client options
 
 ```
-party client --host 192.168.1.10 --name "Alice"       # set your display name in chat
-party client --host 192.168.1.10 --interactive        # manually confirm the host fingerprint
+party client --host 192.168.1.10 --name "Alice"  # set your display name in chat
+party client --host 192.168.1.10 --port 8888     # connect to a non-default port
 ```
 
 ---
@@ -127,11 +124,11 @@ party client --host 192.168.1.10 --interactive        # manually confirm the hos
 
 ### How encryption works
 
-Every session is end-to-end encrypted automatically — no flags required. When a client connects, the host and client perform an **X25519 Diffie-Hellman key exchange** and derive a unique session key. All subsequent traffic (video, audio, chat) is encrypted with **ChaCha20-Poly1305**. Session keys are ephemeral and never stored.
+Every session is end-to-end encrypted — no configuration required. When a client connects, the host and client perform an **X25519 Diffie-Hellman key exchange** and derive a unique session key. All subsequent traffic (video, audio, chat) is encrypted with **ChaCha20-Poly1305**. Session keys are ephemeral and never stored.
 
 ### Fingerprints and identity
 
-Run this once to generate a persistent PGP identity:
+Run this once to generate a persistent identity:
 
 ```
 party host --generate-key
@@ -139,50 +136,27 @@ party host --generate-key
 
 You will be prompted for a nickname and an optional passphrase. The resulting key is saved to `~/.screen-party/identity.asc`. Your **fingerprint** — a hex string derived from your public key — is your stable identity across sessions.
 
-- The host's fingerprint is shown in the **host chat window** at all times (`Your ID: …`).
-- The client's fingerprint and the host's fingerprint are both shown in the **viewer window** chat panel.
-- Your fingerprint appears in chat as `Name [fp6]` (your chosen name, followed by the first 6 hex characters of your fingerprint).
+- The host's fingerprint is shown in the **host chat window** at all times (`Your ID: …`). Share it with your viewers out-of-band (Signal, email, in person) before the session so they can verify it.
+- The client's fingerprint and the host's fingerprint are both shown at the top of the **viewer window** chat panel.
+- Your fingerprint appears in chat as `Name [fp6]` (your chosen name followed by the first 6 hex characters of your fingerprint).
 
-### Known hosts
+### Fingerprint confirmation (always on)
 
-The first time a client connects to a host, the host's fingerprint is automatically saved to `~/.screen-party/known_hosts`. On future connections to the same address and port:
+Every time a client connects to a host they have **not seen before**, they are shown the host's full fingerprint and must type `yes` to proceed. The fingerprint is then saved to `~/.screen-party/known_hosts`.
 
-- If the fingerprint **matches** → `[known]` is shown; no prompt needed.
+On **subsequent connections** to the same host:
+- If the fingerprint **matches** → auto-accepted; the viewer sees `[known]` in their chat panel.
 - If the fingerprint **has changed** → the connection is refused immediately with a warning. This protects against man-in-the-middle attacks.
 
-### Interactive verification
+### Client approval gate (always on)
 
-For higher assurance, run with `--interactive` on both sides:
-
-**Host side:**
-```
-party host --interactive
-```
-Clients that don't pass `--interactive` will be rejected before they see anything.
-
-**Client side:**
-```
-party client --host 192.168.1.10 --interactive
-```
-The client is shown the host's full fingerprint and asked to type `yes` before the connection proceeds. The fingerprint is then saved to known hosts.
-
-> Tip: share your fingerprint with intended viewers out-of-band (Signal, email, in person) before the session so they can verify it matches what the client displays.
-
-### Approval gate
-
-For full host control over who gets in:
-
-```
-party host --approve
-```
-
-With this flag, each connecting client is **held after the speed test** — they cannot see the stream yet. The host chat window shows:
+Every connecting client is **held after the speed test** — they cannot see the stream until the host approves them. The host chat window shows:
 
 ```
 [JOIN] Alice [abc123ef]  →  /approve abc123ef  or  /deny abc123ef [reason]
 ```
 
-Type the command and press Enter to decide. The client waits up to 5 minutes before timing out.
+Type the command in the chat window and press Enter. The client waits up to 5 minutes before timing out.
 
 ---
 

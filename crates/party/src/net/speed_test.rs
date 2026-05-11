@@ -85,7 +85,6 @@ pub fn client_receive_probe(r: &mut impl Read, w: &mut impl Write) -> io::Result
     let start = Instant::now();
     let mut arrivals_us: Vec<u64> = Vec::new();
     let mut total_bytes: u64 = 0;
-    let mut total_chunks: u32 = 0;
 
     loop {
         let (ty, payload) = proto::read_msg(r)?;
@@ -98,7 +97,6 @@ pub fn client_receive_probe(r: &mut impl Read, w: &mut impl Write) -> io::Result
 
         let seq   = u32::from_le_bytes(payload[0..4].try_into().unwrap());
         let total = u32::from_le_bytes(payload[4..8].try_into().unwrap());
-        total_chunks = total;
         total_bytes += (payload.len() - 8) as u64;
         arrivals_us.push(start.elapsed().as_micros() as u64);
 
@@ -114,7 +112,6 @@ pub fn client_receive_probe(r: &mut impl Read, w: &mut impl Write) -> io::Result
         &proto::encode_speed_report(total_bytes, elapsed_us, jitter_us),
     )?;
 
-    let _ = total_chunks;
     Ok(SpeedStats {
         throughput_bps: throughput(total_bytes, elapsed_us),
         jitter_ms: jitter_us / 1000.0,

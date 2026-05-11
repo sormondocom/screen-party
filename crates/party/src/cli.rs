@@ -17,12 +17,6 @@ pub enum Mode {
         /// Generate (or overwrite) a PGP identity before starting
         #[arg(long)]
         generate_key: bool,
-        /// Require clients to perform interactive key-exchange confirmation
-        #[arg(short, long)]
-        interactive: bool,
-        /// Require explicit /approve for each connecting client before they see the stream
-        #[arg(short = 'A', long)]
-        approve: bool,
     },
     /// Connect to a screen sharing host
     Client {
@@ -32,9 +26,6 @@ pub enum Mode {
         /// Port the host is listening on
         #[arg(short, long, default_value_t = 7777)]
         port: u16,
-        /// Interactively confirm the host's key fingerprint before connecting
-        #[arg(short, long)]
-        interactive: bool,
         /// Display name shown to the host and in chat (e.g. "Alice")
         #[arg(short, long)]
         name: Option<String>,

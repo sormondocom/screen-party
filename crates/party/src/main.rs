@@ -66,7 +66,6 @@ enum Phase {
     },
     /// Capture is running; overlay border is visible.
     Capturing {
-        region: Rect,
         stop: Arc<AtomicBool>,
         thread: Option<JoinHandle<()>>,
         hook: Option<Hook>,
@@ -395,7 +394,6 @@ impl App {
         let hook = Hook::install(stop.clone(), self.quit.clone());
 
         self.phase = Phase::Capturing {
-            region,
             stop,
             thread: Some(thread),
             hook: Some(hook),
@@ -412,7 +410,7 @@ impl App {
         }
 
         // Stop capture cleanly before recreating the selector.
-        if let Phase::Capturing { stop, thread, hook, .. } =
+        if let Phase::Capturing { stop, thread, hook } =
             std::mem::replace(
                 &mut self.phase,
                 Phase::Selecting {
@@ -732,23 +730,23 @@ fn main() {
     let cli = cli::Cli::parse();
 
     match cli.mode {
-        cli::Mode::Host { port, generate_key, interactive, approve } => {
+        cli::Mode::Host { port, generate_key } => {
             if generate_key {
                 match identity::run_keygen_wizard() {
                     Ok(_) => {}
                     Err(e) => { eprintln!("keygen: {e}"); return; }
                 }
             }
-            run_host_gui(port, interactive, approve);
+            run_host_gui(port);
         }
 
-        cli::Mode::Client { host, port, interactive, name } => {
-            client_window::run(&host, port, interactive, name);
+        cli::Mode::Client { host, port, name } => {
+            client_window::run(&host, port, name);
         }
     }
 }
 
-fn run_host_gui(port: u16, interactive: bool, require_approval: bool) {
+fn run_host_gui(port: u16) {
     // Load host fingerprint for the handshake (empty string if no identity generated yet).
     let host_fp = identity::load_fingerprint().unwrap_or_default();
     let host_display_name = if host_fp.is_empty() {
@@ -770,7 +768,7 @@ fn run_host_gui(port: u16, interactive: bool, require_approval: bool) {
         }
     };
 
-    let broadcaster = net::Broadcaster::new(interactive, require_approval, host_fp, sample_rate, channels);
+    let broadcaster = net::Broadcaster::new(host_fp, sample_rate, channels);
 
     // Wire up the host chat channel before accepting any clients.
     let (chat_tx, chat_rx) = mpsc::channel::<(String, String)>();
@@ -798,10 +796,7 @@ fn run_host_gui(port: u16, interactive: bool, require_approval: bool) {
             .ok();
     }
 
-    println!(
-        "Screen Party — hosting on port {port}{}",
-        if interactive { " (interactive key exchange required)" } else { "" },
-    );
+    println!("Screen Party — hosting on port {port}");
     println!("  Drag to select a region, release to start capture");
     println!("  Esc Esc  — stop capture and reselect");
     println!("  Ctrl+Q   — quit");

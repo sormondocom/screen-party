@@ -70,10 +70,9 @@ pub fn encode_handshake(interactive_required: bool, fingerprint: &str, pubkey: &
 }
 
 pub struct Handshake {
-    pub version:              u8,
-    pub interactive_required: bool,
-    pub fingerprint:          String,
-    pub pubkey:               [u8; 32],
+    pub version:     u8,
+    pub fingerprint: String,
+    pub pubkey:      [u8; 32],
 }
 
 pub fn decode_handshake(p: &[u8]) -> io::Result<Handshake> {
@@ -83,10 +82,9 @@ pub fn decode_handshake(p: &[u8]) -> io::Result<Handshake> {
     let mut pubkey = [0u8; 32];
     pubkey.copy_from_slice(&p[4 + fp_len..4 + fp_len + 32]);
     Ok(Handshake {
-        version:              p[0],
-        interactive_required: p[1] != 0,
-        fingerprint:          String::from_utf8(p[4..4 + fp_len].to_vec())
-                                  .map_err(|_| bad("bad fingerprint utf8"))?,
+        version:     p[0],
+        fingerprint: String::from_utf8(p[4..4 + fp_len].to_vec())
+                         .map_err(|_| bad("bad fingerprint utf8"))?,
         pubkey,
     })
 }
@@ -265,7 +263,7 @@ pub fn decode_chat_msg(p: &[u8]) -> io::Result<ChatMsg> {
 
 pub struct DecodedRect {
     pub x: u32, pub y: u32,
-    pub w: u32, pub h: u32,
+    pub w: u32,
     pub pixels: Vec<u8>, // RGBA, row-major
 }
 
@@ -289,13 +287,13 @@ pub fn decode_video_frame(payload: &[u8]) -> io::Result<DecodedFrame> {
         let x      = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
         let y      = u32::from_le_bytes(payload[off + 4..off + 8].try_into().unwrap());
         let w      = u32::from_le_bytes(payload[off + 8..off + 12].try_into().unwrap());
-        let h      = u32::from_le_bytes(payload[off + 12..off + 16].try_into().unwrap());
+        let _h     = u32::from_le_bytes(payload[off + 12..off + 16].try_into().unwrap());
         let px_len = u32::from_le_bytes(payload[off + 16..off + 20].try_into().unwrap()) as usize;
         off += 20;
         if payload.len() < off + px_len { return Err(bad("pixel data truncated")); }
         let pixels = payload[off..off + px_len].to_vec();
         off += px_len;
-        rects.push(DecodedRect { x, y, w, h, pixels });
+        rects.push(DecodedRect { x, y, w, pixels });
     }
     Ok(DecodedFrame { width, height, rects })
 }
