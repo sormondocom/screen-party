@@ -54,8 +54,10 @@ struct PendingEntry {
     decision_tx: mpsc::SyncSender<ApprovalDecision>,
 }
 
-// Frames buffered per client before we start dropping.
-const QUEUE_DEPTH: usize = 30;
+// Messages buffered per client before dropping. Sized for ~200 ms of video
+// at 30 fps with headroom for interleaved audio chunks. A deeper queue hides
+// a slow send thread at the cost of silent latency buildup.
+const QUEUE_DEPTH: usize = 6;
 
 // ── Broadcaster ───────────────────────────────────────────────────────────────
 

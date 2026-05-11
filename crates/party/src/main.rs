@@ -726,6 +726,12 @@ fn make_capture_phase(
 // ── main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
+    // Raise Windows multimedia timer resolution to 1 ms so that
+    // thread::sleep calls in the capture loop are accurate instead of
+    // rounding up to the default 15.6 ms system tick.
+    #[cfg(target_os = "windows")]
+    unsafe { windows::Win32::Media::timeBeginPeriod(1); }
+
     let cli = cli::Cli::parse();
 
     match cli.mode {
