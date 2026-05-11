@@ -10,7 +10,7 @@ use std::io::{self, Read, Write};
 
 use capture::{Frame, Rect};
 
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 
 /// Total bytes sent per speed probe pass.
 pub const PROBE_BYTES: usize = 2 * 1024 * 1024; // 2 MB
@@ -171,29 +171,28 @@ pub fn decode_stream_info(p: &[u8]) -> io::Result<StreamInfo> {
 
 // ── Video frame ───────────────────────────────────────────────────────────────
 
-/// Encode dirty rects + their pixels from `frame` into a VIDEO_FRAME payload.
+/// Encode dirty rects + their pixels from `frame` into a compressed VIDEO_FRAME payload.
 ///
-/// Layout: `[u32 frame_w][u32 frame_h][u32 rect_count]{ rect_header + pixels }…`
-/// The frame dimensions allow clients to self-initialise their video buffer
-/// even when STREAM_INFO carried zeros (host hadn't selected a region yet).
-pub fn encode_video_frame(rects: &[Rect], frame: &Frame) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(&frame.width.to_le_bytes());
-    buf.extend_from_slice(&frame.height.to_le_bytes());
-    buf.extend_from_slice(&(rects.len() as u32).to_le_bytes());
+/// Raw layout (before zstd): `[u32 frame_w][u32 frame_h][u32 rect_count]{ rect_header + pixels }…`
+/// The whole thing is then zstd-compressed at level 1 (fast).
+pub fn encode_video_frame(rects: &[Rect], frame: &Frame) -> io::Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    raw.extend_from_slice(&frame.width.to_le_bytes());
+    raw.extend_from_slice(&frame.height.to_le_bytes());
+    raw.extend_from_slice(&(rects.len() as u32).to_le_bytes());
     for r in rects {
-        buf.extend_from_slice(&r.x.to_le_bytes());
-        buf.extend_from_slice(&r.y.to_le_bytes());
-        buf.extend_from_slice(&r.width.to_le_bytes());
-        buf.extend_from_slice(&r.height.to_le_bytes());
+        raw.extend_from_slice(&r.x.to_le_bytes());
+        raw.extend_from_slice(&r.y.to_le_bytes());
+        raw.extend_from_slice(&r.width.to_le_bytes());
+        raw.extend_from_slice(&r.height.to_le_bytes());
         let px_bytes = (r.width * r.height * 4) as usize;
-        buf.extend_from_slice(&(px_bytes as u32).to_le_bytes());
+        raw.extend_from_slice(&(px_bytes as u32).to_le_bytes());
         for row in 0..r.height {
             let off = ((r.y + row) * frame.width + r.x) as usize * 4;
-            buf.extend_from_slice(&frame.data[off..off + r.width as usize * 4]);
+            raw.extend_from_slice(&frame.data[off..off + r.width as usize * 4]);
         }
     }
-    buf
+    zstd::encode_all(std::io::Cursor::new(raw), 1)
 }
 
 // ── Chat message (bidirectional) ──────────────────────────────────────────────
@@ -242,6 +241,8 @@ pub struct DecodedFrame {
 }
 
 pub fn decode_video_frame(payload: &[u8]) -> io::Result<DecodedFrame> {
+    let payload = zstd::decode_all(payload)?;
+    let payload = payload.as_slice();
     if payload.len() < 12 { return Err(bad("frame payload too short")); }
     let width      = u32::from_le_bytes(payload[0..4].try_into().unwrap());
     let height     = u32::from_le_bytes(payload[4..8].try_into().unwrap());

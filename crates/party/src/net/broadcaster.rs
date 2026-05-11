@@ -231,7 +231,7 @@ fn run_client(
                 proto::write_msg(
                     &mut w,
                     proto::msg::VIDEO_FRAME,
-                    &proto::encode_video_frame(rects, frame),
+                    &proto::encode_video_frame(rects, frame)?,
                 )?;
             }
             BroadcastMsg::AudioChunk(samples) => {

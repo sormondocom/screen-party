@@ -17,6 +17,7 @@ hex = "0.4"
 rpassword = "7"
 anyhow = "1"
 font8x8 = "0.3"
+zstd = "0.13"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
