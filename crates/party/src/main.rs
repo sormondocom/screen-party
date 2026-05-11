@@ -48,11 +48,12 @@ const CHAR_W:      u32 = 9;  // 8px glyph + 1px letter spacing
 const CHAR_H:      u32 = 11; // 8px glyph + 3px line gap
 const CHAT_LINES:  usize = 28;
 const CHAT_PAD:    u32 = 8;
-const CHAT_HEIGHT: u32 = CHAT_PAD * 2 + (CHAT_LINES as u32 + 1) * CHAR_H + 4;
+const CHAT_HEIGHT: u32 = CHAT_PAD * 2 + (CHAT_LINES as u32 + 2) * CHAR_H + 4;
 const CHAT_WIDTH:  u32 = 700;
-const COLOR_BG:    u32 = 0x00_1A_1A_2E;
-const COLOR_TEXT:  u32 = 0x00_E0_E0_E0;
-const COLOR_INPUT: u32 = 0x00_88_FF_88;
+const COLOR_BG:     u32 = 0x00_1A_1A_2E;
+const COLOR_TEXT:   u32 = 0x00_E0_E0_E0;
+const COLOR_INPUT:  u32 = 0x00_88_FF_88;
+const COLOR_SYSTEM: u32 = 0x00_FF_AA_00; // amber — join/leave/admin notifications
 
 // ── Application state ─────────────────────────────────────────────────────────
 
@@ -82,6 +83,7 @@ struct App {
     chat_history:      Vec<(String, String)>,
     chat_input:        String,
     host_display_name: String,
+    host_fingerprint:  String,
     tick:              u64,
     // Overlay window — drop order: surface → context → window.
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
@@ -106,6 +108,7 @@ impl App {
         broadcaster:       Option<Arc<net::Broadcaster>>,
         chat_rx:           Option<mpsc::Receiver<(String, String)>>,
         host_display_name: String,
+        host_fingerprint:  String,
     ) -> Self {
         Self {
             quit: Arc::new(AtomicBool::new(false)),
@@ -120,6 +123,7 @@ impl App {
             chat_history: Vec::new(),
             chat_input:   String::new(),
             host_display_name,
+            host_fingerprint,
             tick: 0,
             surface: None,
             context: None,
@@ -147,6 +151,85 @@ impl App {
 
     fn is_chat_window(&self, id: winit::window::WindowId) -> bool {
         self.chat_window.as_ref().map_or(false, |w| w.id() == id)
+    }
+
+    // ── Admin commands ───────────────────────────────────────────────────────
+
+    fn push_sys(&mut self, text: String) {
+        self.chat_history.push((String::new(), text));
+        if self.chat_history.len() > CHAT_LINES * 3 {
+            let excess = self.chat_history.len() - CHAT_LINES;
+            self.chat_history.drain(0..excess);
+        }
+    }
+
+    fn handle_admin_command(&mut self, cmd: String) {
+        let parts: Vec<&str> = cmd.splitn(3, ' ').collect();
+        let Some(b) = self.broadcaster.clone() else {
+            self.push_sys("No broadcaster active".to_string());
+            return;
+        };
+        match parts[0] {
+            "/approve" => match parts.get(1).copied().filter(|s| !s.is_empty()) {
+                Some(fp) => {
+                    if b.approve_pending(fp) {
+                        self.push_sys(format!("Approved {fp}"));
+                    } else {
+                        self.push_sys(format!("No pending client matching '{fp}'"));
+                    }
+                }
+                None => self.push_sys("Usage: /approve <fp>".to_string()),
+            },
+            "/deny" => match parts.get(1).copied().filter(|s| !s.is_empty()) {
+                Some(fp) => {
+                    let reason = parts.get(2).copied().unwrap_or("denied by host");
+                    if b.deny_pending(fp, reason) {
+                        self.push_sys(format!("Denied {fp}"));
+                    } else {
+                        self.push_sys(format!("No pending client matching '{fp}'"));
+                    }
+                }
+                None => self.push_sys("Usage: /deny <fp> [reason]".to_string()),
+            },
+            "/kick" => match parts.get(1).copied().filter(|s| !s.is_empty()) {
+                Some(fp) => {
+                    if b.kick_client(fp) {
+                        self.push_sys(format!("Kicked {fp}"));
+                    } else {
+                        self.push_sys(format!("No viewer matching '{fp}'"));
+                    }
+                }
+                None => self.push_sys("Usage: /kick <fp>".to_string()),
+            },
+            "/viewers" => {
+                let viewers = b.list_viewers();
+                let pending = b.list_pending();
+                if viewers.is_empty() && pending.is_empty() {
+                    self.push_sys("No viewers connected".to_string());
+                } else {
+                    if !viewers.is_empty() {
+                        self.push_sys(format!(
+                            "Watching ({}): {}",
+                            viewers.len(),
+                            viewers.join(", "),
+                        ));
+                    }
+                    if !pending.is_empty() {
+                        self.push_sys(format!(
+                            "Pending ({}): {}",
+                            pending.len(),
+                            pending.join(", "),
+                        ));
+                    }
+                }
+            }
+            "/help" => {
+                self.push_sys(
+                    "/approve <fp>  /deny <fp> [msg]  /kick <fp>  /viewers".to_string(),
+                );
+            }
+            _ => self.push_sys(format!("Unknown command '{}' — type /help", parts[0])),
+        }
     }
 
     fn create_chat_window(&mut self, el: &ActiveEventLoop) {
@@ -181,14 +264,27 @@ impl App {
 
         buf.fill(COLOR_BG);
 
+        // Identity header.
+        let id_str = if self.host_fingerprint.is_empty() {
+            "Your ID: (no identity — run with --generate-key)".to_string()
+        } else {
+            format!("Your ID: {}", &self.host_fingerprint)
+        };
+        draw_str(&mut buf, w, CHAT_PAD, CHAT_PAD, &id_str, COLOR_INPUT);
+
+        // History (shifted down one row for the header).
         let start = self.chat_history.len().saturating_sub(CHAT_LINES);
         for (i, (sender, text)) in self.chat_history[start..].iter().enumerate() {
-            let ly = CHAT_PAD + i as u32 * CHAR_H;
-            let line = format!("{sender}: {text}");
-            draw_str(&mut buf, w, CHAT_PAD, ly, &line, COLOR_TEXT);
+            let ly = CHAT_PAD + CHAR_H + i as u32 * CHAR_H;
+            let (line, color) = if sender.is_empty() {
+                (text.clone(), COLOR_SYSTEM)
+            } else {
+                (format!("{sender}: {text}"), COLOR_TEXT)
+            };
+            draw_str(&mut buf, w, CHAT_PAD, ly, &line, color);
         }
 
-        let input_y = CHAT_PAD + CHAT_LINES as u32 * CHAR_H + 4;
+        let input_y = CHAT_PAD + CHAR_H + CHAT_LINES as u32 * CHAR_H + 4;
         let cursor = if (self.tick / 30) % 2 == 0 { "_" } else { " " };
         let input_display = format!("> {}{}", self.chat_input, cursor);
         draw_str(&mut buf, w, CHAT_PAD, input_y, &input_display, COLOR_INPUT);
@@ -535,7 +631,9 @@ impl ApplicationHandler for App {
                         }
                         Key::Named(NamedKey::Enter) => {
                             let text = std::mem::take(&mut self.chat_input);
-                            if !text.is_empty() {
+                            if text.starts_with('/') {
+                                self.handle_admin_command(text);
+                            } else if !text.is_empty() {
                                 let sender = self.host_display_name.clone();
                                 self.chat_history.push((sender.clone(), text.clone()));
                                 if self.chat_history.len() > CHAT_LINES * 3 {
@@ -634,14 +732,14 @@ fn main() {
     let cli = cli::Cli::parse();
 
     match cli.mode {
-        cli::Mode::Host { port, generate_key, interactive } => {
+        cli::Mode::Host { port, generate_key, interactive, approve } => {
             if generate_key {
                 match identity::run_keygen_wizard() {
                     Ok(_) => {}
                     Err(e) => { eprintln!("keygen: {e}"); return; }
                 }
             }
-            run_host_gui(port, interactive);
+            run_host_gui(port, interactive, approve);
         }
 
         cli::Mode::Client { host, port, interactive, name } => {
@@ -650,7 +748,7 @@ fn main() {
     }
 }
 
-fn run_host_gui(port: u16, interactive: bool) {
+fn run_host_gui(port: u16, interactive: bool, require_approval: bool) {
     // Load host fingerprint for the handshake (empty string if no identity generated yet).
     let host_fp = identity::load_fingerprint().unwrap_or_default();
     let host_display_name = if host_fp.is_empty() {
@@ -658,6 +756,7 @@ fn run_host_gui(port: u16, interactive: bool) {
     } else {
         host_fp.get(..8).unwrap_or(&host_fp).to_string()
     };
+    let host_fingerprint = host_fp.clone();
 
     // Probe audio config before opening the listener so STREAM_INFO carries
     // real values.  Audio capture starts immediately so the first client
@@ -671,7 +770,7 @@ fn run_host_gui(port: u16, interactive: bool) {
         }
     };
 
-    let broadcaster = net::Broadcaster::new(interactive, host_fp, sample_rate, channels);
+    let broadcaster = net::Broadcaster::new(interactive, require_approval, host_fp, sample_rate, channels);
 
     // Wire up the host chat channel before accepting any clients.
     let (chat_tx, chat_rx) = mpsc::channel::<(String, String)>();
@@ -725,7 +824,7 @@ fn run_host_gui(port: u16, interactive: bool) {
     let mut event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::new(display, Some(broadcaster), Some(chat_rx), host_display_name);
+    let mut app = App::new(display, Some(broadcaster), Some(chat_rx), host_display_name, host_fingerprint);
     event_loop.run_app_on_demand(&mut app).ok();
     println!("Goodbye.");
 }

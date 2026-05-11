@@ -26,8 +26,8 @@ const CHAR_W:      u32 = 16; // 8px glyph × 2 scale
 const CHAR_H:      u32 = 16;
 const CHAT_LINES:  usize = 6;
 const CHAT_PAD:    u32 = 8;
-// panel height: top_pad + history rows + gap + input row + bottom_pad
-const CHAT_HEIGHT: u32 = CHAT_PAD * 2 + (CHAT_LINES as u32 + 1) * CHAR_H + 4;
+// panel height: top_pad + id header + history rows + gap + input row + bottom_pad
+const CHAT_HEIGHT: u32 = CHAT_PAD * 2 + (CHAT_LINES as u32 + 2) * CHAR_H + 4;
 
 const COLOR_BG:     u32 = 0x00_1A_1A_2E;
 const COLOR_TEXT:   u32 = 0x00_E0_E0_E0;
@@ -45,6 +45,10 @@ struct ClientApp {
     stream_h:     u32,
     video_buf:    Vec<u32>, // 0x00RRGGBB, stream_w * stream_h pixels
     audio_out:    Option<CpalPlayer>,
+    // Identity
+    client_fp:    String,
+    host_fp:      String,
+    host_trusted: Option<bool>, // None = not yet received, Some(true) = known, Some(false) = new
     // Chat state
     chat_history: Vec<(String, String)>, // (sender, text)
     chat_input:   String,
@@ -59,7 +63,11 @@ struct ClientApp {
 }
 
 impl ClientApp {
-    fn new(event_rx: mpsc::Receiver<ClientEvent>, send_tx: mpsc::Sender<ClientSend>) -> Self {
+    fn new(
+        event_rx:  mpsc::Receiver<ClientEvent>,
+        send_tx:   mpsc::Sender<ClientSend>,
+        client_fp: String,
+    ) -> Self {
         Self {
             event_rx,
             send_tx,
@@ -67,6 +75,9 @@ impl ClientApp {
             stream_h:     0,
             video_buf:    Vec::new(),
             audio_out:    None,
+            client_fp,
+            host_fp:      String::new(),
+            host_trusted: None,
             chat_history: Vec::new(),
             chat_input:   String::new(),
             menu_open:    false,
@@ -148,6 +159,14 @@ impl ClientApp {
                     }
                 }
 
+                ClientEvent::PeerInfo { host_fingerprint, trusted } => {
+                    self.host_fp      = host_fingerprint;
+                    self.host_trusted = Some(trusted);
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
+
                 ClientEvent::Disconnected { reason } => {
                     println!("[net] disconnected: {reason}");
                     self.disconnected = true;
@@ -194,15 +213,35 @@ impl ClientApp {
             buf[base..base + w as usize].fill(COLOR_BG);
         }
 
+        // Identity header: "You: fp8  Host: fp8 [known/new]"
+        let header_y = panel_y + CHAT_PAD;
+        let you_fp = self.client_fp.get(..8).unwrap_or(&self.client_fp);
+        let you_str = format!("You: {you_fp}");
+        draw_str(&mut buf, w, CHAT_PAD, header_y, &you_str, COLOR_INPUT);
+
+        let host_str = if self.host_fp.is_empty() {
+            "  Host: ...".to_string()
+        } else {
+            let fp = self.host_fp.get(..8).unwrap_or(&self.host_fp);
+            match self.host_trusted {
+                Some(true)  => format!("  Host: {fp} [known]"),
+                Some(false) => format!("  Host: {fp} [new]"),
+                None        => format!("  Host: {fp}"),
+            }
+        };
+        let host_x = CHAT_PAD + you_str.len() as u32 * CHAR_W;
+        draw_str(&mut buf, w, host_x, header_y, &host_str, COLOR_TEXT);
+
+        // History (shifted down one row for the header).
         let start = self.chat_history.len().saturating_sub(CHAT_LINES);
         for (i, (sender, text)) in self.chat_history[start..].iter().enumerate() {
-            let ly = panel_y + CHAT_PAD + i as u32 * CHAR_H;
+            let ly = panel_y + CHAT_PAD + CHAR_H + i as u32 * CHAR_H;
             let line = format!("{sender}: {text}");
             draw_str(&mut buf, w, CHAT_PAD, ly, &line, COLOR_TEXT);
         }
 
         // Input line with blinking cursor.
-        let input_y = panel_y + CHAT_PAD + CHAT_LINES as u32 * CHAR_H + 4;
+        let input_y = panel_y + CHAT_PAD + CHAR_H + CHAT_LINES as u32 * CHAR_H + 4;
         let cursor = if (self.tick / 30) % 2 == 0 { "_" } else { " " };
         let input_display = format!("> {}{}", self.chat_input, cursor);
         draw_str(&mut buf, w, CHAT_PAD, input_y, &input_display, COLOR_INPUT);
@@ -347,7 +386,7 @@ pub fn run(host: &str, port: u16, interactive: bool, name: Option<String>) {
 
     let mut event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = ClientApp::new(event_rx, send_tx);
+    let mut app = ClientApp::new(event_rx, send_tx, client_fp);
     event_loop.run_app_on_demand(&mut app).ok();
 }
 

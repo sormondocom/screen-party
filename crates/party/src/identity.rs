@@ -201,3 +201,56 @@ pub fn interactive_key_confirm(host: &str, fingerprint: &str) -> io::Result<bool
     io::stdin().read_line(&mut answer)?;
     Ok(answer.trim().eq_ignore_ascii_case("yes"))
 }
+
+// ── Known hosts ───────────────────────────────────────────────────────────────
+
+pub enum KnownHostStatus {
+    Unknown,
+    Trusted,
+    FingerprintChanged,
+}
+
+pub fn known_hosts_path() -> PathBuf {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".screen-party").join("known_hosts")
+}
+
+/// Check if `host:port` is in the known-hosts file.
+/// Returns `Trusted` if fingerprint matches, `FingerprintChanged` if it differs,
+/// `Unknown` if the host has not been seen before.
+pub fn check_known_host(host: &str, port: u16, fingerprint: &str) -> KnownHostStatus {
+    let content = match std::fs::read_to_string(known_hosts_path()) {
+        Ok(c) => c,
+        Err(_) => return KnownHostStatus::Unknown,
+    };
+    let key = format!("{host}:{port}");
+    for line in content.lines() {
+        let mut parts = line.splitn(2, ' ');
+        if let (Some(k), Some(fp)) = (parts.next(), parts.next()) {
+            if k == key {
+                return if fp.trim() == fingerprint {
+                    KnownHostStatus::Trusted
+                } else {
+                    KnownHostStatus::FingerprintChanged
+                };
+            }
+        }
+    }
+    KnownHostStatus::Unknown
+}
+
+/// Append `host:port fingerprint` to the known-hosts file.
+pub fn save_known_host(host: &str, port: u16, fingerprint: &str) -> io::Result<()> {
+    let path = known_hosts_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    f.write_all(format!("{host}:{port} {fingerprint}\n").as_bytes())
+}

@@ -1,7 +1,7 @@
 # Screen Party
 
 <p align="center">
-  <img src="assets/mascot.svg" alt="Screen Party mascot — an angel with laser eyes broadcasting to Earth" width="320"/>
+  <img src="assets/mascot.svg" alt="Screen Party mascot — a sun broadcasting sound waves and laser beams to Earth" width="320"/>
 </p>
 
 <p align="center">
@@ -14,35 +14,202 @@ No accounts. No cloud relay. No subscription. Run the host on your machine, shar
 
 ---
 
-## Goals
+## Quick start
 
-- **Free** — open source, no licensing costs, no usage limits
-- **Secure** — PGP-based identity and fingerprint verification; no third-party servers involved in your session
-- **Self-hosted** — direct TCP connection from host to clients; your data never touches an intermediary
-- **Low friction** — drag to select a region, press Enter, done
+**On the sharing machine:**
+```
+party host
+```
+A fullscreen overlay appears. Drag to select the region you want to share, then release the mouse or press Enter. Sharing begins immediately. Share your IP address with your viewers.
+
+**On each viewer machine:**
+```
+party client --host 192.168.1.10
+```
+A window opens and fills with the host's stream as soon as it arrives. That's it.
+
+---
+
+## Host walkthrough
+
+### 1. Start the host
+
+```
+party host
+```
+
+- Listens on port 7777 by default.
+- The fullscreen selection overlay appears on startup.
+- Drag to draw a rectangle over what you want to share, then release the mouse (or press Enter) to start broadcasting.
+
+| Action | Effect |
+|--------|--------|
+| Drag + release | Start capture of selected region |
+| Enter | Confirm current selection |
+| Esc (during drag) | Cancel the drag |
+| Esc Esc (double, within 400 ms, while capturing) | Stop capture and go back to selection |
+| Ctrl+Q | Quit |
+
+### 2. Chat
+
+Once capture starts, a **chat window** opens in the corner of your screen. Type there to send messages to all viewers. Viewers can reply from their viewer window.
+
+System events (connections, approvals, disconnections) appear in **amber** so they stand out from regular chat.
+
+### 3. Admin commands
+
+Type any of these in the host chat window and press Enter:
+
+| Command | Effect |
+|---------|--------|
+| `/approve <fp>` | Let a pending client through (with `--approve` mode) |
+| `/deny <fp> [reason]` | Reject a pending client; the reason is shown to them |
+| `/kick <fp>` | Disconnect a currently-streaming viewer |
+| `/viewers` | List who is watching and who is pending |
+| `/help` | Print the command list |
+
+`<fp>` is the first 8 characters of the client's fingerprint, shown in the `[JOIN]` notification.
+
+### 4. Host options
+
+```
+party host --port 8888              # listen on a different port (default: 7777)
+party host --generate-key           # create or replace your PGP identity
+party host --interactive            # require clients to confirm your fingerprint before connecting
+party host --approve                # hold each client at the door until you /approve them
+party host --interactive --approve  # both: clients confirm your key, then you confirm theirs
+```
+
+---
+
+## Client walkthrough
+
+### 1. Connect
+
+```
+party client --host 192.168.1.10
+party client --host 192.168.1.10 --port 8888   # if the host uses a non-default port
+```
+
+The viewer window opens and scales the stream to fill it. Audio plays automatically.
+
+### 2. Chat
+
+The bottom strip of the viewer window is always the chat panel. Just start typing — no need to click anywhere. Press Enter to send.
+
+Your identity and the host's identity are shown at the top of the chat panel:
+```
+You: abc123ef   Host: def456gh [known]
+```
+
+`[known]` means this host's fingerprint matches what was recorded the first time you connected. `[new]` means this is your first connection to this host.
+
+### 3. Viewer controls
+
+| Action | Effect |
+|--------|--------|
+| Type + Enter | Send a chat message |
+| Backspace | Delete last chat character |
+| Escape | Open the disconnect menu |
+| D (in menu) | Disconnect and close |
+| C or Escape (in menu) | Close the menu |
+
+### 4. Client options
+
+```
+party client --host 192.168.1.10 --name "Alice"       # set your display name in chat
+party client --host 192.168.1.10 --interactive        # manually confirm the host fingerprint
+```
+
+---
+
+## Identity and security
+
+### How encryption works
+
+Every session is end-to-end encrypted automatically — no flags required. When a client connects, the host and client perform an **X25519 Diffie-Hellman key exchange** and derive a unique session key. All subsequent traffic (video, audio, chat) is encrypted with **ChaCha20-Poly1305**. Session keys are ephemeral and never stored.
+
+### Fingerprints and identity
+
+Run this once to generate a persistent PGP identity:
+
+```
+party host --generate-key
+```
+
+You will be prompted for a nickname and an optional passphrase. The resulting key is saved to `~/.screen-party/identity.asc`. Your **fingerprint** — a hex string derived from your public key — is your stable identity across sessions.
+
+- The host's fingerprint is shown in the **host chat window** at all times (`Your ID: …`).
+- The client's fingerprint and the host's fingerprint are both shown in the **viewer window** chat panel.
+- Your fingerprint appears in chat as `Name [fp6]` (your chosen name, followed by the first 6 hex characters of your fingerprint).
+
+### Known hosts
+
+The first time a client connects to a host, the host's fingerprint is automatically saved to `~/.screen-party/known_hosts`. On future connections to the same address and port:
+
+- If the fingerprint **matches** → `[known]` is shown; no prompt needed.
+- If the fingerprint **has changed** → the connection is refused immediately with a warning. This protects against man-in-the-middle attacks.
+
+### Interactive verification
+
+For higher assurance, run with `--interactive` on both sides:
+
+**Host side:**
+```
+party host --interactive
+```
+Clients that don't pass `--interactive` will be rejected before they see anything.
+
+**Client side:**
+```
+party client --host 192.168.1.10 --interactive
+```
+The client is shown the host's full fingerprint and asked to type `yes` before the connection proceeds. The fingerprint is then saved to known hosts.
+
+> Tip: share your fingerprint with intended viewers out-of-band (Signal, email, in person) before the session so they can verify it matches what the client displays.
+
+### Approval gate
+
+For full host control over who gets in:
+
+```
+party host --approve
+```
+
+With this flag, each connecting client is **held after the speed test** — they cannot see the stream yet. The host chat window shows:
+
+```
+[JOIN] Alice [abc123ef]  →  /approve abc123ef  or  /deny abc123ef [reason]
+```
+
+Type the command and press Enter to decide. The client waits up to 5 minutes before timing out.
 
 ---
 
 ## Features
 
-- Drag-to-select screen region capture with a live selection overlay
-- System audio loopback capture streamed alongside video (Windows WASAPI; no virtual cable needed)
-- Delta-only video transmission — only changed screen regions are sent each frame, compressed with zstd
-- Multi-client fanout — one host, many simultaneous viewers
-- Built-in chat — bidirectional text between host and all connected clients
-- PGP identity fingerprints — optionally require viewers to interactively confirm the host's key before connecting
-- Connection speed probe — jitter-adaptive audio buffering sized to actual link conditions
-- 30 fps cap with sub-frame sleep to keep CPU and bandwidth predictable
+- **End-to-end encryption** — X25519 key exchange, ChaCha20-Poly1305 AEAD, per-session ephemeral keys
+- **PGP identity** — stable fingerprint across sessions, saved as an armored key in `~/.screen-party/`
+- **Known hosts** — automatic fingerprint pinning; changed fingerprints are refused
+- **Client approval gate** — hold viewers at the door with `--approve`; approve, deny, or kick via chat commands
+- **Display names** — clients set `--name "Alice"`; shown as `Alice [fp6]` in chat
+- **Screen capture** — drag-to-select region, 30 fps, cyan border overlay while capturing
+- **Delta compression** — quadtree dirty-rect detection + zstd; only changed pixels are transmitted
+- **System audio** — Windows WASAPI loopback capture; no virtual cable needed
+- **Multi-client fanout** — one host, unlimited simultaneous viewers
+- **Bidirectional chat** — host and all viewers share a single chat room
+- **Speed probe** — jitter-measured audio pre-buffering sized to actual link conditions
+- **Viewer reconnect** — re-select region with double-Esc without restarting the host
 
 ---
 
 ## Platform support
 
-| Platform | Screen capture | Audio loopback |
-|----------|---------------|----------------|
-| Windows  | DXGI Desktop Duplication | WASAPI loopback (no virtual cable) |
-| macOS    | planned | planned |
-| Linux    | planned | planned |
+| Platform | Screen capture | Audio |
+|----------|---------------|-------|
+| Windows | DXGI Desktop Duplication | WASAPI loopback (no virtual cable) |
+| macOS | planned | planned |
+| Linux | planned | planned |
 
 ---
 
@@ -56,54 +223,7 @@ cd screen-party
 cargo build --release
 ```
 
-The release binary is `target/release/party` (or `party.exe` on Windows). The Windows release build uses the GUI subsystem — no console window appears.
-
----
-
-## Usage
-
-### Host
-
-```
-party host
-```
-
-Starts listening on port 7777. A fullscreen overlay appears — drag to select the region you want to share, then release the mouse (or press Enter) to begin capture.
-
-| Action | Effect |
-|--------|--------|
-| Drag + release | Start capture of selected region |
-| Esc Esc (double, within 400 ms) | Stop capture and reselect |
-| Ctrl+Q | Quit |
-
-**Options:**
-
-```
-party host --port <PORT>        # listen on a different port (default: 7777)
-party host --generate-key       # create or replace your PGP identity
-party host --interactive        # require clients to confirm your fingerprint
-```
-
-### Client
-
-```
-party client --host <IP or hostname>
-```
-
-Opens a viewer window that scales to fill as the host's stream arrives. Chat input is always active at the bottom of the window. Press Escape to open the disconnect menu.
-
-```
-party client --host 192.168.1.10 --port 7777
-party client --host 192.168.1.10 --interactive   # verify host fingerprint before connecting
-```
-
-### Identity / key management
-
-```
-party host --generate-key
-```
-
-Generates a PGP keypair stored locally. The first 8 characters of your public key fingerprint become your display name in chat. Run once before your first hosted session if you want a stable identity.
+The release binary is `target/release/party.exe` on Windows. The Windows release build uses the GUI subsystem — no console window appears.
 
 ---
 
@@ -112,11 +232,11 @@ Generates a PGP keypair stored locally. The first 8 characters of your public ke
 ```
 crates/
   capture/   — DXGI screen capture, quadtree dirty-rect detector, region selector UI
-  audio/     — WASAPI loopback capture, cpal playback
-  party/     — binary: phase state machine, broadcaster, TCP protocol, chat UI
+  audio/     — WASAPI loopback capture, cpal playback with jitter buffer
+  party/     — binary: phase state machine, broadcaster, TCP protocol, chat UI, identity
 ```
 
-The wire protocol is a simple length-prefixed framing (`[u32 len][u8 type][payload]`). Video payloads are zstd-compressed dirty-rect bundles. Audio is interleaved f32 PCM. Chat is UTF-8 with sender/text length-prefixed fields. Protocol version is checked at handshake; mismatched versions disconnect cleanly.
+The wire protocol is a simple length-prefixed framing (`[u32 len][u8 type][payload]`), transparently wrapped in per-session ChaCha20-Poly1305 AEAD records after the X25519 handshake. Video payloads are zstd-compressed dirty-rect bundles. Audio is raw interleaved f32 PCM. Chat and control messages are UTF-8 with length-prefixed fields. Protocol version is checked at handshake; version mismatches disconnect cleanly.
 
 ---
 
@@ -124,9 +244,10 @@ The wire protocol is a simple length-prefixed framing (`[u32 len][u8 type][paylo
 
 - [ ] macOS and Linux platform implementations
 - [ ] H.264 / hardware-accelerated video encoding
-- [ ] End-to-end encryption of the stream
-- [ ] Multi-monitor selection
-- [ ] Client reconnection on drop
+- [ ] Adaptive bitrate / FPS based on ongoing link quality
+- [ ] Multi-monitor selection UI
+- [ ] Client reconnect on connection drop
+- [ ] NAT traversal / relay for internet sessions
 
 ---
 

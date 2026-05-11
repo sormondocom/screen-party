@@ -20,6 +20,9 @@ pub enum Mode {
         /// Require clients to perform interactive key-exchange confirmation
         #[arg(short, long)]
         interactive: bool,
+        /// Require explicit /approve for each connecting client before they see the stream
+        #[arg(short = 'A', long)]
+        approve: bool,
     },
     /// Connect to a screen sharing host
     Client {

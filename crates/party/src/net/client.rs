@@ -23,6 +23,7 @@ pub enum ClientEvent {
     VideoFrame(proto::DecodedFrame),
     AudioChunk(Vec<f32>),
     ChatMessage { sender: String, text: String },
+    PeerInfo { host_fingerprint: String, trusted: bool },
     Disconnected { reason: String },
 }
 
@@ -84,8 +85,23 @@ pub fn run_network(
         ));
     }
 
+    // ── Known-host trust check ────────────────────────────────────────────────
+    let host_trust = identity::check_known_host(&host, port, &hs.fingerprint);
+    if let identity::KnownHostStatus::FingerprintChanged = host_trust {
+        proto::write_msg(&mut &wstrm, proto::msg::DISCONNECT, b"fingerprint mismatch")?;
+        eprintln!(
+            "\nSECURITY WARNING: the fingerprint for {host}:{port} has changed!\n  \
+             Presented: {}\n  \
+             This may indicate a man-in-the-middle attack.\n  \
+             If you trust this host, delete ~/.screen-party/known_hosts and reconnect.",
+            hs.fingerprint
+        );
+        return Err(io::Error::new(io::ErrorKind::Other, "fingerprint mismatch — connection aborted"));
+    }
+    let already_trusted = matches!(host_trust, identity::KnownHostStatus::Trusted);
+
     let interactive_confirmed = if hs.interactive_required {
-        if !interactive {
+        if !interactive && !already_trusted {
             eprintln!("Host requires --interactive. Re-run with --interactive.");
             proto::write_msg(&mut &wstrm, proto::msg::DISCONNECT, b"interactive required")?;
             return Err(io::Error::new(
@@ -93,16 +109,27 @@ pub fn run_network(
                 "host requires interactive confirmation",
             ));
         }
-        match identity::interactive_key_confirm(&host, &hs.fingerprint) {
-            Ok(true) => true,
-            Ok(false) => {
-                proto::write_msg(&mut &wstrm, proto::msg::DISCONNECT, b"user declined")?;
-                println!("Connection declined.");
-                return Ok(());
+        if already_trusted {
+            println!("[identity] known host — skipping confirmation prompt");
+            true
+        } else {
+            match identity::interactive_key_confirm(&host, &hs.fingerprint) {
+                Ok(true) => {
+                    let _ = identity::save_known_host(&host, port, &hs.fingerprint);
+                    true
+                }
+                Ok(false) => {
+                    proto::write_msg(&mut &wstrm, proto::msg::DISCONNECT, b"user declined")?;
+                    println!("Connection declined.");
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
         }
     } else {
+        if !already_trusted {
+            let _ = identity::save_known_host(&host, port, &hs.fingerprint);
+        }
         false
     };
 
@@ -111,6 +138,11 @@ pub fn run_network(
         proto::msg::HANDSHAKE_ACK,
         &proto::encode_ack(interactive_confirmed, &client_fingerprint, &kp.public_bytes, &clean_name),
     )?;
+
+    let _ = event_tx.send(ClientEvent::PeerInfo {
+        host_fingerprint: hs.fingerprint,
+        trusted: already_trusted,
+    });
 
     // ── Derive session cipher ─────────────────────────────────────────────────
     let keys = kp.complete(&hs.pubkey, Role::Client);
@@ -130,6 +162,8 @@ pub fn run_network(
     }
 
     // ── Stream info (encrypted) ───────────────────────────────────────────────
+    // Give the host up to 5 minutes to approve this connection before timing out.
+    ctrl.set_read_timeout(Some(Duration::from_secs(300)))?;
     let (ty, payload) = proto::read_msg(&mut r)?;
     if ty == proto::msg::HANDSHAKE_REJECT {
         let reason = String::from_utf8_lossy(&payload).into_owned();
