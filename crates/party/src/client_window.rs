@@ -10,7 +10,7 @@ use font8x8::UnicodeFonts;
 use softbuffer::{Context, Surface};
 use winit::{
     application::ApplicationHandler,
-    event::{ElementState, WindowEvent},
+    event::{ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{Key, NamedKey},
     platform::run_on_demand::EventLoopExtRunOnDemand,
@@ -25,22 +25,28 @@ use crate::net::proto::DecodedFrame;
 
 // ── Layout constants ──────────────────────────────────────────────────────────
 
-const CHAR_W:      u32 = 16; // 8px glyph × 2 scale
-const CHAR_H:      u32 = 16;
-const CHAT_LINES:  usize = 6;
+const CHAR_W:      u32 = 9;  // 8px glyph + 1px letter spacing
+const CHAR_H:      u32 = 11; // 8px glyph + 3px line gap
+const CHAT_LINES:  usize = 28;
 const CHAT_PAD:    u32 = 8;
-// panel height: top_pad + id header + history rows + gap + input row + bottom_pad
 const CHAT_HEIGHT: u32 = CHAT_PAD * 2 + (CHAT_LINES as u32 + 2) * CHAR_H + 4;
 
 // Hard ceiling on the decode queue. Frames beyond this are dropped
 // oldest-first so the viewer stays within ~4 s of live content.
 const VIDEO_MAX_QUEUE: usize = 120;
 
-const COLOR_BG:     u32 = 0x00_1A_1A_2E;
-const COLOR_TEXT:   u32 = 0x00_E0_E0_E0;
-const COLOR_INPUT:  u32 = 0x00_88_FF_88;
-const COLOR_MENU:   u32 = 0x00_11_11_44;
-const COLOR_MENU_T: u32 = 0x00_EE_EE_FF;
+const COLOR_BG:       u32 = 0x00_1A_1A_2E;
+const COLOR_TEXT:     u32 = 0x00_E0_E0_E0;
+const COLOR_INPUT:    u32 = 0x00_88_FF_88;
+const COLOR_SYSTEM:   u32 = 0x00_FF_AA_00;
+const COLOR_MENU:     u32 = 0x00_11_11_44;
+const COLOR_MENU_T:   u32 = 0x00_EE_EE_FF;
+const COLOR_EDGE:     u32 = 0x00_25_25_3E;
+
+const EDGE_W:         u32 = 3;   // px wide/tall resize handles
+const EDGE_HIT:       f64 = 8.0; // px either side that triggers a drag
+const CHAT_MIN_W:     u32 = 200;
+const CHAT_MIN_H:     u32 = 50;
 
 // ── ClientApp ─────────────────────────────────────────────────────────────────
 
@@ -65,8 +71,13 @@ struct ClientApp {
     // Chat state
     chat_history: Vec<(String, String)>, // (sender, text)
     chat_input:   String,
+    chat_w:       u32,   // panel pixel width;  0 = full window width
+    chat_h:       u32,   // panel pixel height; 0 = CHAT_HEIGHT default
     // UI state
-    menu_open:    bool,
+    cursor_pos:     Option<(f64, f64)>,
+    drag_chat_edge: bool, // dragging right edge (width)
+    drag_chat_top:  bool, // dragging top edge (height)
+    menu_open:     bool,
     tick:         u64,
     disconnected: bool,
     // Winit / softbuffer handles
@@ -98,6 +109,11 @@ impl ClientApp {
             host_trusted:    None,
             chat_history:    Vec::new(),
             chat_input:      String::new(),
+            chat_w:          0,
+            chat_h:          0,
+            cursor_pos:      None,
+            drag_chat_edge:  false,
+            drag_chat_top:   false,
             menu_open:       false,
             tick:            0,
             disconnected:    false,
@@ -290,44 +306,94 @@ impl ClientApp {
         }
 
         // ── Chat panel ────────────────────────────────────────────────────────
-        let panel_y = h.saturating_sub(CHAT_HEIGHT);
+        let chat_h  = if self.chat_h == 0 { CHAT_HEIGHT } else { self.chat_h.min(h) };
+        let panel_y = h.saturating_sub(chat_h);
+        let chat_w  = if self.chat_w == 0 { w } else { self.chat_w.min(w) };
+
         for row in panel_y..h {
             let base = (row * w) as usize;
-            buf[base..base + w as usize].fill(COLOR_BG);
+            let end  = (base + chat_w as usize).min(buf.len());
+            buf[base..end].fill(COLOR_BG);
         }
+
+        // Top-edge resize handle.
+        for col in 0..chat_w {
+            for dy in 0..EDGE_W {
+                set_px(&mut buf, w, col, panel_y + dy, COLOR_EDGE);
+            }
+        }
+
+        // Right-edge resize handle.
+        if chat_w >= EDGE_W {
+            let hx = chat_w - EDGE_W;
+            for row in panel_y..h {
+                for dx in 0..EDGE_W {
+                    set_px(&mut buf, w, hx + dx, row, COLOR_EDGE);
+                }
+            }
+        }
+
+        let chars_per_line = (chat_w.saturating_sub(CHAT_PAD * 2 + EDGE_W) / CHAR_W).max(1) as usize;
+
+        // Pre-wrap input so history knows how much space to leave.
+        let cursor_char = if (self.tick / 30) % 2 == 0 { "_" } else { " " };
+        let input_display = format!("> {}{}", self.chat_input, cursor_char);
+        let input_wrapped = wrap_line(&input_display, chars_per_line);
+        let input_line_count = input_wrapped.len() as u32;
+        let input_top_y = h.saturating_sub(CHAT_PAD + CHAR_H * input_line_count);
 
         // Identity header: "You: fp8  Host: fp8 [known/new]"
         let header_y = panel_y + CHAT_PAD;
         let you_fp = self.client_fp.get(..8).unwrap_or(&self.client_fp);
-        let you_str = format!("You: {you_fp}");
-        draw_str(&mut buf, w, CHAT_PAD, header_y, &you_str, COLOR_INPUT);
-
-        let host_str = if self.host_fp.is_empty() {
-            "  Host: ...".to_string()
+        let host_part = if self.host_fp.is_empty() {
+            "Host: ...".to_string()
         } else {
             let fp = self.host_fp.get(..8).unwrap_or(&self.host_fp);
             match self.host_trusted {
-                Some(true)  => format!("  Host: {fp} [known]"),
-                Some(false) => format!("  Host: {fp} [new]"),
-                None        => format!("  Host: {fp}"),
+                Some(true)  => format!("Host: {fp} [known]"),
+                Some(false) => format!("Host: {fp} [new]"),
+                None        => format!("Host: {fp}"),
             }
         };
-        let host_x = CHAT_PAD + you_str.len() as u32 * CHAR_W;
-        draw_str(&mut buf, w, host_x, header_y, &host_str, COLOR_TEXT);
-
-        // History (shifted down one row for the header).
-        let start = self.chat_history.len().saturating_sub(CHAT_LINES);
-        for (i, (sender, text)) in self.chat_history[start..].iter().enumerate() {
-            let ly = panel_y + CHAT_PAD + CHAR_H + i as u32 * CHAR_H;
-            let line = format!("{sender}: {text}");
-            draw_str(&mut buf, w, CHAT_PAD, ly, &line, COLOR_TEXT);
+        let id_str = format!("You: {you_fp}  {host_part}");
+        if header_y < input_top_y {
+            for (i, line) in wrap_line(&id_str, chars_per_line).iter().enumerate() {
+                let ly = header_y + i as u32 * CHAR_H;
+                if ly + CHAR_H > input_top_y { break; }
+                draw_str(&mut buf, w, CHAT_PAD, ly, line, COLOR_INPUT);
+            }
         }
 
-        // Input line with blinking cursor.
-        let input_y = panel_y + CHAT_PAD + CHAR_H + CHAT_LINES as u32 * CHAR_H + 4;
-        let cursor = if (self.tick / 30) % 2 == 0 { "_" } else { " " };
-        let input_display = format!("> {}{}", self.chat_input, cursor);
-        draw_str(&mut buf, w, CHAT_PAD, input_y, &input_display, COLOR_INPUT);
+        // History: wrap every line, show most-recent that fit above the input.
+        let history_top = header_y + CHAR_H;
+        let history_bot = input_top_y.saturating_sub(4);
+        if history_bot > history_top {
+            let avail = ((history_bot - history_top) / CHAR_H) as usize;
+            let mut wrapped: Vec<(String, u32)> = Vec::new();
+            for (sender, text) in &self.chat_history {
+                let (line_str, color) = if sender.is_empty() {
+                    (text.clone(), COLOR_SYSTEM)
+                } else {
+                    (format!("{sender}: {text}"), COLOR_TEXT)
+                };
+                for wl in wrap_line(&line_str, chars_per_line) {
+                    wrapped.push((wl, color));
+                }
+            }
+            let skip = wrapped.len().saturating_sub(avail);
+            for (i, (line, color)) in wrapped[skip..].iter().enumerate() {
+                let ly = history_top + i as u32 * CHAR_H;
+                if ly + CHAR_H > history_bot { break; }
+                draw_str(&mut buf, w, CHAT_PAD, ly, line, *color);
+            }
+        }
+
+        // Input pinned to bottom, growing upward as it wraps.
+        for (i, line) in input_wrapped.iter().enumerate() {
+            let ly = input_top_y + i as u32 * CHAR_H;
+            if ly + CHAR_H > h { break; }
+            draw_str(&mut buf, w, CHAT_PAD, ly, line, COLOR_INPUT);
+        }
 
         // ── Menu overlay (Escape) ─────────────────────────────────────────────
         if self.menu_open {
@@ -443,6 +509,47 @@ impl ApplicationHandler for ClientApp {
                 }
             }
 
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_pos = Some((position.x, position.y));
+                if self.drag_chat_edge || self.drag_chat_top {
+                    if let Some(win) = &self.window {
+                        let sz = win.inner_size();
+                        if self.drag_chat_edge {
+                            self.chat_w = (position.x as u32).clamp(CHAT_MIN_W, sz.width);
+                        }
+                        if self.drag_chat_top {
+                            self.chat_h = sz.height.saturating_sub(position.y as u32).clamp(CHAT_MIN_H, sz.height);
+                        }
+                        win.request_redraw();
+                    }
+                }
+            }
+
+            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
+                match state {
+                    ElementState::Pressed if !self.menu_open => {
+                        if let (Some((cx, cy)), Some(win)) = (self.cursor_pos, &self.window) {
+                            let sz = win.inner_size();
+                            let ch = if self.chat_h == 0 { CHAT_HEIGHT } else { self.chat_h.min(sz.height) };
+                            let cw = if self.chat_w == 0 { sz.width  } else { self.chat_w.min(sz.width) };
+                            let panel_y = sz.height.saturating_sub(ch) as f64;
+                            if cy >= panel_y {
+                                if (cx - cw as f64).abs() < EDGE_HIT {
+                                    self.drag_chat_edge = true;
+                                } else if (cy - panel_y).abs() < EDGE_HIT {
+                                    self.drag_chat_top = true;
+                                }
+                            }
+                        }
+                    }
+                    ElementState::Released => {
+                        self.drag_chat_edge = false;
+                        self.drag_chat_top  = false;
+                    }
+                    _ => {}
+                }
+            }
+
             _ => {}
         }
     }
@@ -491,17 +598,34 @@ fn draw_char(buf: &mut [u32], stride: u32, x: u32, y: u32, ch: char, color: u32)
         for (row_i, &row_bits) in glyph.iter().enumerate() {
             for col_i in 0..8u32 {
                 if (row_bits >> col_i) & 1 != 0 {
-                    // Render at 2× scale (each pixel → 2×2 block).
-                    let px = x + col_i * 2;
-                    let py = y + row_i as u32 * 2;
-                    set_px(buf, stride, px,     py,     color);
-                    set_px(buf, stride, px + 1, py,     color);
-                    set_px(buf, stride, px,     py + 1, color);
-                    set_px(buf, stride, px + 1, py + 1, color);
+                    set_px(buf, stride, x + col_i, y + row_i as u32, color);
                 }
             }
         }
     }
+}
+
+fn wrap_line(s: &str, max_chars: usize) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    if max_chars == 0 || chars.len() <= max_chars {
+        return vec![chars.iter().collect()];
+    }
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let end = (start + max_chars).min(chars.len());
+        let break_at = if end < chars.len() {
+            chars[start..end].iter().rposition(|&c| c == ' ')
+                .map(|i| start + i + 1)
+                .unwrap_or(end)
+        } else {
+            end
+        };
+        out.push(chars[start..break_at].iter().collect::<String>().trim_end().to_string());
+        start = break_at;
+    }
+    if out.is_empty() { out.push(String::new()); }
+    out
 }
 
 fn draw_str(buf: &mut [u32], stride: u32, x: u32, y: u32, s: &str, color: u32) {

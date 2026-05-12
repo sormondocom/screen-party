@@ -18,15 +18,13 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use capture::{Frame, Rect};
-
 use super::cipher::{EncryptedReader, EncryptedWriter, EphemeralKeypair, Role};
 use super::{proto, speed_test};
 
 // ── Public message types ──────────────────────────────────────────────────────
 
 pub enum BroadcastMsg {
-    VideoFrame { rects: Vec<Rect>, frame: Arc<Frame> },
+    VideoFrame(Arc<Vec<u8>>),
     AudioChunk(Arc<Vec<u8>>),
     ChatMessage { sender: String, text: String },
     /// Sent to every client (or one client for a kick) to close the session.
@@ -55,10 +53,7 @@ struct PendingEntry {
 }
 
 // Messages buffered per client before dropping. Sized for a full GOP worth of
-// video at 30 fps plus headroom for interleaved audio chunks. The send thread
-// still runs zstd encoding (~5–15 ms per frame) so bursts of audio chunks
-// can arrive faster than frames are written; 16 slots absorbs those bursts
-// without false "slow client" drops on healthy LAN connections.
+// video at 30 fps plus headroom for interleaved audio chunks.
 const QUEUE_DEPTH: usize = 16;
 
 // ── Broadcaster ───────────────────────────────────────────────────────────────
@@ -350,12 +345,8 @@ fn run_client(
 fn send_loop(w: &mut impl Write, rx: mpsc::Receiver<Arc<BroadcastMsg>>) -> io::Result<()> {
     for msg in rx {
         match msg.as_ref() {
-            BroadcastMsg::VideoFrame { rects, frame } => {
-                proto::write_msg(
-                    w,
-                    proto::msg::VIDEO_FRAME,
-                    &proto::encode_video_frame(rects, frame)?,
-                )?;
+            BroadcastMsg::VideoFrame(payload) => {
+                proto::write_msg(w, proto::msg::VIDEO_FRAME, payload)?;
             }
             BroadcastMsg::AudioChunk(samples) => {
                 proto::write_msg(w, proto::msg::AUDIO_CHUNK, samples)?;

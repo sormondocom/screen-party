@@ -48,12 +48,15 @@ const CHAR_W:      u32 = 9;  // 8px glyph + 1px letter spacing
 const CHAR_H:      u32 = 11; // 8px glyph + 3px line gap
 const CHAT_LINES:  usize = 28;
 const CHAT_PAD:    u32 = 8;
-const CHAT_HEIGHT: u32 = CHAT_PAD * 2 + (CHAT_LINES as u32 + 2) * CHAR_H + 4;
+const DRAG_BAR_H:  u32 = 14;
+const CHAT_HEIGHT: u32 = DRAG_BAR_H + CHAT_PAD * 2 + (CHAT_LINES as u32 + 2) * CHAR_H + 4;
 const CHAT_WIDTH:  u32 = 700;
-const COLOR_BG:     u32 = 0x00_1A_1A_2E;
-const COLOR_TEXT:   u32 = 0x00_E0_E0_E0;
-const COLOR_INPUT:  u32 = 0x00_88_FF_88;
-const COLOR_SYSTEM: u32 = 0x00_FF_AA_00; // amber — join/leave/admin notifications
+const RESIZE_ZONE: f64 = 6.0;
+const COLOR_BG:       u32 = 0x00_1A_1A_2E;
+const COLOR_TEXT:     u32 = 0x00_E0_E0_E0;
+const COLOR_INPUT:    u32 = 0x00_88_FF_88;
+const COLOR_SYSTEM:   u32 = 0x00_FF_AA_00; // amber — join/leave/admin notifications
+const COLOR_DRAG_BAR: u32 = 0x00_25_25_3E;
 
 // ── Application state ─────────────────────────────────────────────────────────
 
@@ -81,6 +84,7 @@ struct App {
     chat_rx:           Option<mpsc::Receiver<(String, String)>>,
     chat_history:      Vec<(String, String)>,
     chat_input:        String,
+    chat_cursor:       Option<(f64, f64)>,
     host_display_name: String,
     host_fingerprint:  String,
     tick:              u64,
@@ -121,6 +125,7 @@ impl App {
             chat_rx,
             chat_history: Vec::new(),
             chat_input:   String::new(),
+            chat_cursor:  None,
             host_display_name,
             host_fingerprint,
             tick: 0,
@@ -259,34 +264,79 @@ impl App {
         else { return };
         if srf.resize(nw, nh).is_err() { return; }
         let Ok(mut buf) = srf.buffer_mut() else { return };
-        let (w, _h) = (sz.width, sz.height);
+        let (w, h) = (sz.width, sz.height);
 
         buf.fill(COLOR_BG);
 
-        // Identity header.
-        let id_str = if self.host_fingerprint.is_empty() {
-            "Your ID: (no identity — run with --generate-key)".to_string()
-        } else {
-            format!("Your ID: {}", &self.host_fingerprint)
-        };
-        draw_str(&mut buf, w, CHAT_PAD, CHAT_PAD, &id_str, COLOR_INPUT);
-
-        // History (shifted down one row for the header).
-        let start = self.chat_history.len().saturating_sub(CHAT_LINES);
-        for (i, (sender, text)) in self.chat_history[start..].iter().enumerate() {
-            let ly = CHAT_PAD + CHAR_H + i as u32 * CHAR_H;
-            let (line, color) = if sender.is_empty() {
-                (text.clone(), COLOR_SYSTEM)
-            } else {
-                (format!("{sender}: {text}"), COLOR_TEXT)
-            };
-            draw_str(&mut buf, w, CHAT_PAD, ly, &line, color);
+        // Drag bar.
+        let bar_px = ((DRAG_BAR_H * w) as usize).min(buf.len());
+        buf[..bar_px].fill(COLOR_DRAG_BAR);
+        let dot_y = DRAG_BAR_H / 2 - 1;
+        let cx = w / 2;
+        for i in 0..3u32 {
+            let dx = cx.saturating_sub(7) + i * 7;
+            for dy in 0..2 {
+                set_px(&mut buf, w, dx,     dot_y + dy, COLOR_TEXT);
+                set_px(&mut buf, w, dx + 1, dot_y + dy, COLOR_TEXT);
+            }
         }
 
-        let input_y = CHAT_PAD + CHAR_H + CHAT_LINES as u32 * CHAR_H + 4;
-        let cursor = if (self.tick / 30) % 2 == 0 { "_" } else { " " };
-        let input_display = format!("> {}{}", self.chat_input, cursor);
-        draw_str(&mut buf, w, CHAT_PAD, input_y, &input_display, COLOR_INPUT);
+        let chars_per_line = (w.saturating_sub(CHAT_PAD * 2) / CHAR_W).max(1) as usize;
+
+        // Pre-wrap the input so we know how many lines it occupies before
+        // computing the history region.
+        let cursor_char = if (self.tick / 30) % 2 == 0 { "_" } else { " " };
+        let input_display = format!("> {}{}", self.chat_input, cursor_char);
+        let input_wrapped = wrap_line(&input_display, chars_per_line);
+        let input_line_count = input_wrapped.len() as u32;
+        let input_top_y = h.saturating_sub(CHAT_PAD + CHAR_H * input_line_count);
+
+        // Identity header below drag bar.
+        let header_y = DRAG_BAR_H + CHAT_PAD;
+        if header_y < input_top_y {
+            let id_str = if self.host_fingerprint.is_empty() {
+                "Your ID: (no identity — run with --generate-key)".to_string()
+            } else {
+                format!("Your ID: {}", &self.host_fingerprint)
+            };
+            for (i, line) in wrap_line(&id_str, chars_per_line).iter().enumerate() {
+                let ly = header_y + i as u32 * CHAR_H;
+                if ly + CHAR_H > input_top_y { break; }
+                draw_str(&mut buf, w, CHAT_PAD, ly, line, COLOR_INPUT);
+            }
+        }
+
+        // History: wrap every line to the current column width, then show as
+        // many of the most-recent wrapped lines as fit above the input.
+        let history_top = header_y + CHAR_H;
+        let history_bot = input_top_y.saturating_sub(4);
+        if history_bot > history_top {
+            let avail = ((history_bot - history_top) / CHAR_H) as usize;
+            let mut wrapped: Vec<(String, u32)> = Vec::new();
+            for (sender, text) in &self.chat_history {
+                let (line_str, color) = if sender.is_empty() {
+                    (text.clone(), COLOR_SYSTEM)
+                } else {
+                    (format!("{sender}: {text}"), COLOR_TEXT)
+                };
+                for wl in wrap_line(&line_str, chars_per_line) {
+                    wrapped.push((wl, color));
+                }
+            }
+            let skip = wrapped.len().saturating_sub(avail);
+            for (i, (line, color)) in wrapped[skip..].iter().enumerate() {
+                let ly = history_top + i as u32 * CHAR_H;
+                if ly + CHAR_H > history_bot { break; }
+                draw_str(&mut buf, w, CHAT_PAD, ly, line, *color);
+            }
+        }
+
+        // Input lines pinned to bottom, growing upward as they wrap.
+        for (i, line) in input_wrapped.iter().enumerate() {
+            let ly = input_top_y + i as u32 * CHAR_H;
+            if ly + CHAR_H > h { break; }
+            draw_str(&mut buf, w, CHAT_PAD, ly, line, COLOR_INPUT);
+        }
 
         let _ = buf.present();
     }
@@ -371,10 +421,10 @@ impl App {
                         let dirty = detector.feed(frame.clone());
                         if !dirty.is_empty() {
                             if let Some(b) = &broadcaster {
-                                b.broadcast(Arc::new(net::BroadcastMsg::VideoFrame {
-                                    rects: dirty,
-                                    frame,
-                                }));
+                                match net::proto::encode_video_frame(&dirty, &frame) {
+                                    Ok(payload) => b.broadcast(Arc::new(net::BroadcastMsg::VideoFrame(Arc::new(payload)))),
+                                    Err(e) => eprintln!("encode error: {e}"),
+                                }
                             }
                         }
                     }
@@ -686,7 +736,39 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } => {
-                if let Phase::Selecting { drag_start, cursor, .. } = &mut self.phase {
+                if self.is_chat_window(id) {
+                    if state == ElementState::Pressed {
+                        let maybe_sz = self.chat_window.as_ref().map(|w| w.inner_size());
+                        if let (Some(sz), Some((cx, cy))) = (maybe_sz, self.chat_cursor) {
+                            let (fw, fh) = (sz.width as f64, sz.height as f64);
+                            let rz = RESIZE_ZONE;
+                            let (left, right, top, bot) = (
+                                cx < rz, cx > fw - rz, cy < rz, cy > fh - rz,
+                            );
+                            use winit::window::ResizeDirection as RD;
+                            let resize_dir = match (left, right, top, bot) {
+                                (true,  false, true,  false) => Some(RD::NorthWest),
+                                (false, true,  true,  false) => Some(RD::NorthEast),
+                                (true,  false, false, true)  => Some(RD::SouthWest),
+                                (false, true,  false, true)  => Some(RD::SouthEast),
+                                (true,  false, false, false) => Some(RD::West),
+                                (false, true,  false, false) => Some(RD::East),
+                                (false, false, true,  false) => Some(RD::North),
+                                (false, false, false, true)  => Some(RD::South),
+                                _ => None,
+                            };
+                            if let Some(dir) = resize_dir {
+                                if let Some(win) = &self.chat_window {
+                                    let _ = win.drag_resize_window(dir);
+                                }
+                            } else if cy < DRAG_BAR_H as f64 {
+                                if let Some(win) = &self.chat_window {
+                                    let _ = win.drag_window();
+                                }
+                            }
+                        }
+                    }
+                } else if let Phase::Selecting { drag_start, cursor, .. } = &mut self.phase {
                     match state {
                         ElementState::Pressed => *drag_start = *cursor,
                         ElementState::Released => {
@@ -698,7 +780,9 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                if let Phase::Selecting { cursor, .. } = &mut self.phase {
+                if self.is_chat_window(id) {
+                    self.chat_cursor = Some((position.x, position.y));
+                } else if let Phase::Selecting { cursor, .. } = &mut self.phase {
                     *cursor = Some((position.x, position.y));
                 }
             }
@@ -706,6 +790,29 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
+}
+
+fn wrap_line(s: &str, max_chars: usize) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    if max_chars == 0 || chars.len() <= max_chars {
+        return vec![chars.iter().collect()];
+    }
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let end = (start + max_chars).min(chars.len());
+        let break_at = if end < chars.len() {
+            chars[start..end].iter().rposition(|&c| c == ' ')
+                .map(|i| start + i + 1)
+                .unwrap_or(end)
+        } else {
+            end
+        };
+        out.push(chars[start..break_at].iter().collect::<String>().trim_end().to_string());
+        start = break_at;
+    }
+    if out.is_empty() { out.push(String::new()); }
+    out
 }
 
 fn make_capture_phase(
