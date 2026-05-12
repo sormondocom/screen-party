@@ -62,7 +62,7 @@ Type any of these in the host chat window and press Enter:
 
 | Command | Effect |
 |---------|--------|
-| `/approve <fp>` | Let a pending client through (with `--approve` mode) |
+| `/approve <fp>` | Let a pending client through |
 | `/deny <fp> [reason]` | Reject a pending client; the reason is shown to them |
 | `/kick <fp>` | Disconnect a currently-streaming viewer |
 | `/viewers` | List who is watching and who is pending |
@@ -165,14 +165,15 @@ Type the command in the chat window and press Enter. The client waits up to 5 mi
 - **End-to-end encryption** — X25519 key exchange, ChaCha20-Poly1305 AEAD, per-session ephemeral keys
 - **PGP identity** — stable fingerprint across sessions, saved as an armored key in `~/.screen-party/`
 - **Known hosts** — automatic fingerprint pinning; changed fingerprints are refused
-- **Client approval gate** — hold viewers at the door with `--approve`; approve, deny, or kick via chat commands
+- **Client approval gate** — every viewer is held until the host approves; approve, deny, or kick via chat commands
 - **Display names** — clients set `--name "Alice"`; shown as `Alice [fp6]` in chat
 - **Screen capture** — drag-to-select region, 30 fps, cyan border overlay while capturing
 - **Delta compression** — quadtree dirty-rect detection + zstd; only changed pixels are transmitted
 - **System audio** — Windows WASAPI loopback capture; no virtual cable needed
 - **Multi-client fanout** — one host, unlimited simultaneous viewers
 - **Bidirectional chat** — host and all viewers share a single chat room
-- **Speed probe** — jitter-measured audio pre-buffering sized to actual link conditions
+- **Speed probe** — jitter-measured pre-buffering sized to actual link conditions
+- **Video playback buffer** — client-side frame queue absorbs network jitter; prebuffer depth auto-sized from the speed probe; hard ceiling drops oldest frames to stay within ~4 s of live
 - **Viewer reconnect** — re-select region with double-Esc without restarting the host
 
 ---
