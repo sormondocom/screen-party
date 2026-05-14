@@ -17,6 +17,9 @@ pub enum Mode {
         /// Generate (or overwrite) a PGP identity before starting
         #[arg(long)]
         generate_key: bool,
+        /// Host-side stream cache duration in seconds (ring buffer for smooth client catch-up)
+        #[arg(long, default_value_t = 10.0)]
+        cache_secs: f32,
     },
     /// Connect to a screen sharing host
     Client {

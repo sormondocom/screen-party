@@ -58,26 +58,40 @@ const COLOR_INPUT:    u32 = 0x00_88_FF_88;
 const COLOR_SYSTEM:   u32 = 0x00_FF_AA_00; // amber — join/leave/admin notifications
 const COLOR_DRAG_BAR: u32 = 0x00_25_25_3E;
 
+// ── Selector window ───────────────────────────────────────────────────────────
+
+/// One fullscreen overlay per display, shown during region selection.
+struct SelWin {
+    display_id: u32,
+    window:     Rc<Window>,
+    #[allow(dead_code)] // held for drop order: surface → context → window
+    context:    Context<Rc<Window>>,
+    surface:    Surface<Rc<Window>, Rc<Window>>,
+}
+
 // ── Application state ─────────────────────────────────────────────────────────
 
 enum Phase {
-    /// Showing the fullscreen region-selection overlay.
+    /// Showing fullscreen region-selection overlays on every display.
     Selecting {
-        drag_start: Option<(f64, f64)>,
-        cursor: Option<(f64, f64)>,
-        modifiers: Modifiers,
+        /// Which display the current drag is on (None while no drag is in progress).
+        drag_display: Option<u32>,
+        drag_start:   Option<(f64, f64)>,
+        cursor:       Option<(f64, f64)>,
+        modifiers:    Modifiers,
     },
-    /// Capture is running; overlay border is visible.
+    /// Capture is running; border overlay is visible on the captured display.
     Capturing {
-        stop: Arc<AtomicBool>,
+        stop:   Arc<AtomicBool>,
         thread: Option<JoinHandle<()>>,
-        hook: Option<Hook>,
+        hook:   Option<Hook>,
     },
 }
 
 struct App {
     quit:        Arc<AtomicBool>,
-    display:     DisplayInfo,
+    /// All displays enumerated at startup.
+    displays:    Vec<DisplayInfo>,
     phase:       Phase,
     broadcaster: Option<Arc<net::Broadcaster>>,
     // Chat state
@@ -88,10 +102,14 @@ struct App {
     host_display_name: String,
     host_fingerprint:  String,
     tick:              u64,
-    // Overlay window — drop order: surface → context → window.
-    surface: Option<Surface<Rc<Window>, Rc<Window>>>,
-    context: Option<Context<Rc<Window>>>,
-    window:  Option<Rc<Window>>,
+    // Selector windows — one per display, active during Selecting phase.
+    // Drop order within each SelWin: surface → context → window.
+    sel_wins: Vec<SelWin>,
+    // Capture border overlay — single window, active during Capturing phase.
+    // Drop order: surface → context → window.
+    cap_surface: Option<Surface<Rc<Window>, Rc<Window>>>,
+    cap_context: Option<Context<Rc<Window>>>,
+    cap_window:  Option<Rc<Window>>,
     // Chat window (created while Capturing, destroyed on return to Selecting).
     chat_surface: Option<Surface<Rc<Window>, Rc<Window>>>,
     chat_context: Option<Context<Rc<Window>>>,
@@ -102,12 +120,12 @@ struct App {
 
 enum PendingPhase {
     Selecting,
-    Capturing(Rect),
+    Capturing { display_id: u32, region: Rect },
 }
 
 impl App {
     fn new(
-        display:           DisplayInfo,
+        displays:          Vec<DisplayInfo>,
         broadcaster:       Option<Arc<net::Broadcaster>>,
         chat_rx:           Option<mpsc::Receiver<(String, String)>>,
         host_display_name: String,
@@ -115,11 +133,12 @@ impl App {
     ) -> Self {
         Self {
             quit: Arc::new(AtomicBool::new(false)),
-            display,
+            displays,
             phase: Phase::Selecting {
-                drag_start: None,
-                cursor: None,
-                modifiers: Modifiers::default(),
+                drag_display: None,
+                drag_start:   None,
+                cursor:       None,
+                modifiers:    Modifiers::default(),
             },
             broadcaster,
             chat_rx,
@@ -129,22 +148,27 @@ impl App {
             host_display_name,
             host_fingerprint,
             tick: 0,
-            surface: None,
-            context: None,
-            window: None,
+            sel_wins:    Vec::new(),
+            cap_surface: None,
+            cap_context: None,
+            cap_window:  None,
             chat_surface: None,
             chat_context: None,
             chat_window:  None,
-            next_phase: None,
+            next_phase:  None,
         }
     }
 
     // ── Window management ────────────────────────────────────────────────────
 
-    fn destroy_window(&mut self) {
-        self.surface = None;
-        self.context = None;
-        self.window = None;
+    fn destroy_selector_windows(&mut self) {
+        self.sel_wins.clear(); // Drop order within each SelWin: surface → context → window.
+    }
+
+    fn destroy_cap_window(&mut self) {
+        self.cap_surface = None;
+        self.cap_context = None;
+        self.cap_window  = None;
     }
 
     fn destroy_chat_window(&mut self) {
@@ -153,7 +177,11 @@ impl App {
         self.chat_window  = None;
     }
 
-    fn is_chat_window(&self, id: winit::window::WindowId) -> bool {
+    fn selector_idx_for(&self, id: WindowId) -> Option<usize> {
+        self.sel_wins.iter().position(|sw| sw.window.id() == id)
+    }
+
+    fn is_chat_window(&self, id: WindowId) -> bool {
         self.chat_window.as_ref().map_or(false, |w| w.id() == id)
     }
 
@@ -238,12 +266,23 @@ impl App {
 
     fn create_chat_window(&mut self, el: &ActiveEventLoop) {
         self.destroy_chat_window();
-        let chat_x = (self.display.width as i32).saturating_sub(CHAT_WIDTH as i32);
+        // Always open on the primary display (x=0, y=0 on Windows) so the host
+        // can see chat regardless of which display they're capturing.
+        let primary = self.displays.iter()
+            .find(|d| d.primary)
+            .or_else(|| self.displays.first());
+        let (chat_x, chat_y) = match primary {
+            Some(d) => (
+                d.x + (d.width as i32).saturating_sub(CHAT_WIDTH as i32),
+                d.y,
+            ),
+            None => (0, 0),
+        };
         let attrs = Window::default_attributes()
             .with_title("Screen Party — chat")
             .with_decorations(false)
             .with_window_level(WindowLevel::AlwaysOnTop)
-            .with_position(winit::dpi::PhysicalPosition::new(chat_x, 0))
+            .with_position(winit::dpi::PhysicalPosition::new(chat_x, chat_y))
             .with_inner_size(winit::dpi::PhysicalSize::new(CHAT_WIDTH, CHAT_HEIGHT));
         let w = match el.create_window(attrs) {
             Ok(w) => Rc::new(w),
@@ -254,6 +293,235 @@ impl App {
         self.chat_surface = Some(srf);
         self.chat_context = Some(ctx);
         self.chat_window  = Some(w);
+    }
+
+    fn create_selector_windows(&mut self, el: &ActiveEventLoop) {
+        self.destroy_selector_windows();
+        for display in &self.displays {
+            // Pre-position the window inside the target display so that
+            // Fullscreen::Borderless(None) — which picks the monitor containing the
+            // window — always lands on the correct screen.  Matching via
+            // available_monitors() is fragile under DPI scaling, so we avoid it.
+            let cx = display.x + display.width  as i32 / 2;
+            let cy = display.y + display.height as i32 / 2;
+            let attrs = Window::default_attributes()
+                .with_title("Screen Party — drag to select | Ctrl+Q to quit")
+                .with_decorations(false)
+                .with_transparent(true)
+                .with_position(winit::dpi::PhysicalPosition::new(cx, cy))
+                .with_inner_size(winit::dpi::PhysicalSize::new(1u32, 1u32))
+                .with_fullscreen(Some(Fullscreen::Borderless(None)));
+            let w = match el.create_window(attrs) {
+                Ok(w) => Rc::new(w),
+                Err(e) => {
+                    eprintln!("selector window (display {}): {e}", display.id);
+                    continue;
+                }
+            };
+            let ctx = Context::new(w.clone()).expect("softbuffer ctx");
+            let srf = Surface::new(&ctx, w.clone()).expect("softbuffer surface");
+            self.sel_wins.push(SelWin {
+                display_id: display.id,
+                window:     w,
+                context:    ctx,
+                surface:    srf,
+            });
+        }
+    }
+
+    fn create_overlay_window(&mut self, el: &ActiveEventLoop, display: &DisplayInfo, region: Rect) {
+        self.destroy_cap_window();
+        // Position uses virtual desktop coordinates: display origin + display-local region offset.
+        let attrs = Window::default_attributes()
+            .with_decorations(false)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_position(winit::dpi::PhysicalPosition::new(
+                display.x + region.x as i32,
+                display.y + region.y as i32,
+            ))
+            .with_inner_size(winit::dpi::PhysicalSize::new(
+                region.width,
+                region.height,
+            ));
+        let w = match el.create_window(attrs) {
+            Ok(w) => Rc::new(w),
+            Err(e) => { eprintln!("overlay window: {e}"); return; }
+        };
+        let _ = w.set_cursor_hittest(false);
+        let ctx = Context::new(w.clone()).expect("softbuffer ctx");
+        let srf = Surface::new(&ctx, w.clone()).expect("softbuffer surface");
+        set_frame_region(&w, region.width, region.height, CAP_BORDER_W);
+        self.cap_surface = Some(srf);
+        self.cap_context = Some(ctx);
+        self.cap_window  = Some(w);
+    }
+
+    // ── Phase transitions ────────────────────────────────────────────────────
+
+    fn enter_capturing(&mut self, el: &ActiveEventLoop, display_id: u32, region: Rect) {
+        let display = self.displays.iter()
+            .find(|d| d.id == display_id)
+            .or_else(|| self.displays.first())
+            .cloned()
+            .expect("at least one display");
+
+        self.destroy_selector_windows();
+        self.create_overlay_window(el, &display, region);
+        self.create_chat_window(el);
+
+        // Advertise real capture dimensions to connecting clients.
+        if let Some(b) = &self.broadcaster {
+            b.set_stream_dims(region.width, region.height, 30);
+        }
+
+        let stop        = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let config      = QuadTreeConfig::for_resolution(region.width, region.height);
+        let broadcaster = self.broadcaster.clone();
+
+        let thread = std::thread::spawn(move || {
+            let mut capturer = match platform::new_capturer(&display, region) {
+                Ok(c) => c,
+                Err(e) => { eprintln!("capture start: {e}"); return; }
+            };
+            let mut detector = DeltaDetector::new(config);
+            let frame_budget = std::time::Duration::from_nanos(1_000_000_000 / 30);
+            while !stop_thread.load(Ordering::Relaxed) {
+                let frame_start = std::time::Instant::now();
+                match capturer.next_frame() {
+                    Ok(frame) => {
+                        let frame = Arc::new(frame);
+                        let dirty = detector.feed(frame.clone());
+                        if !dirty.is_empty() {
+                            if let Some(b) = &broadcaster {
+                                match net::proto::encode_video_frame(&dirty, &frame) {
+                                    Ok(payload) => b.broadcast(Arc::new(net::BroadcastMsg::VideoFrame(Arc::new(payload)))),
+                                    Err(e) => eprintln!("encode error: {e}"),
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("capture error: {e}");
+                        stop_thread.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                let elapsed = frame_start.elapsed();
+                if elapsed < frame_budget {
+                    std::thread::sleep(frame_budget - elapsed);
+                }
+            }
+        });
+
+        let hook = Hook::install(stop.clone(), self.quit.clone());
+
+        self.phase = Phase::Capturing {
+            stop,
+            thread: Some(thread),
+            hook:   Some(hook),
+        };
+    }
+
+    fn enter_selecting(&mut self, el: &ActiveEventLoop) {
+        self.destroy_chat_window();
+        self.chat_input.clear();
+
+        // Capture stopped — reset dims so clients connecting mid-select get zeros.
+        if let Some(b) = &self.broadcaster {
+            b.set_stream_dims(0, 0, 0);
+        }
+
+        // Stop capture cleanly before recreating the selectors.
+        if let Phase::Capturing { stop, thread, hook } =
+            std::mem::replace(
+                &mut self.phase,
+                Phase::Selecting {
+                    drag_display: None,
+                    drag_start:   None,
+                    cursor:       None,
+                    modifiers:    Modifiers::default(),
+                },
+            )
+        {
+            drop(hook); // uninstall keyboard hook first
+            stop.store(true, Ordering::Relaxed);
+            if let Some(h) = thread {
+                let _ = h.join(); // capture thread exits in ≤ 33 ms
+            }
+        }
+
+        self.destroy_cap_window();
+        self.create_selector_windows(el);
+    }
+
+    // ── Rendering ────────────────────────────────────────────────────────────
+
+    /// Render one selector window, identified by its winit WindowId.
+    fn render_selector(&mut self, id: WindowId) {
+        let Some(idx) = self.selector_idx_for(id) else { return };
+        let display_id = self.sel_wins[idx].display_id;
+
+        let (drag_display, drag_start, cursor) = match &self.phase {
+            Phase::Selecting { drag_display, drag_start, cursor, .. } =>
+                (*drag_display, *drag_start, *cursor),
+            _ => return,
+        };
+
+        let sel_win = &mut self.sel_wins[idx];
+        let sz = sel_win.window.inner_size();
+        let (Some(nw), Some(nh)) =
+            (NonZeroU32::new(sz.width), NonZeroU32::new(sz.height))
+        else { return };
+        if sel_win.surface.resize(nw, nh).is_err() { return; }
+        let Ok(mut buf) = sel_win.surface.buffer_mut() else { return };
+        let (w, h) = (sz.width, sz.height);
+
+        buf.fill(SEL_OVERLAY);
+
+        // Draw the drag rectangle only on the display where the drag is active.
+        if drag_display == Some(display_id) {
+            if let (Some(a), Some(b)) = (drag_start, cursor) {
+                let x1 = a.0.min(b.0) as u32;
+                let y1 = a.1.min(b.1) as u32;
+                let x2 = (a.0.max(b.0) as u32).min(w.saturating_sub(1));
+                let y2 = (a.1.max(b.1) as u32).min(h.saturating_sub(1));
+                for row in y1..=y2 {
+                    let s = (row * w + x1) as usize;
+                    let e = (row * w + x2 + 1).min(buf.len() as u32) as usize;
+                    buf[s..e].fill(SEL_INTERIOR);
+                }
+                for col in x1..=x2 {
+                    for d in 0..SEL_BORDER_W {
+                        set_px(&mut buf, w, col, y1 + d, SEL_BORDER);
+                        set_px(&mut buf, w, col, y2.saturating_sub(d), SEL_BORDER);
+                    }
+                }
+                for row in y1..=y2 {
+                    for d in 0..SEL_BORDER_W {
+                        set_px(&mut buf, w, x1 + d, row, SEL_BORDER);
+                        set_px(&mut buf, w, x2.saturating_sub(d), row, SEL_BORDER);
+                    }
+                }
+            }
+        }
+
+        let _ = buf.present();
+    }
+
+    /// Render the capture border overlay (Capturing phase only).
+    fn render_cap(&mut self) {
+        let (Some(win), Some(srf)) = (&self.cap_window, &mut self.cap_surface) else { return };
+        let sz = win.inner_size();
+        let (Some(nw), Some(nh)) =
+            (NonZeroU32::new(sz.width), NonZeroU32::new(sz.height))
+        else { return };
+        if srf.resize(nw, nh).is_err() { return; }
+        let Ok(mut buf) = srf.buffer_mut() else { return };
+        // Fill the whole buffer with cyan. SetWindowRgn has already punched out
+        // the interior, so only the border pixels are visible.
+        buf.fill(CAP_BORDER);
+        let _ = buf.present();
     }
 
     fn render_chat(&mut self) {
@@ -340,192 +608,6 @@ impl App {
 
         let _ = buf.present();
     }
-
-    fn create_selector_window(&mut self, el: &ActiveEventLoop) {
-        self.destroy_window();
-        let attrs = Window::default_attributes()
-            .with_title("Screen Party — drag to select | Ctrl+Q to quit")
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_fullscreen(Some(Fullscreen::Borderless(None)));
-        let w = match el.create_window(attrs) {
-            Ok(w) => Rc::new(w),
-            Err(e) => { eprintln!("selector window: {e}"); return; }
-        };
-        let ctx = Context::new(w.clone()).expect("softbuffer ctx");
-        let srf = Surface::new(&ctx, w.clone()).expect("softbuffer surface");
-        self.surface = Some(srf);
-        self.context = Some(ctx);
-        self.window = Some(w);
-    }
-
-    fn create_overlay_window(&mut self, el: &ActiveEventLoop, region: Rect) {
-        self.destroy_window();
-        // Do NOT use with_transparent(true): on Windows that sets
-        // WS_EX_NOREDIRECTIONBITMAP which disables the DC that softbuffer
-        // needs for BitBlt.  We add WS_EX_LAYERED manually below instead.
-        let attrs = Window::default_attributes()
-            .with_decorations(false)
-            .with_window_level(WindowLevel::AlwaysOnTop)
-            .with_position(winit::dpi::PhysicalPosition::new(
-                region.x as i32,
-                region.y as i32,
-            ))
-            .with_inner_size(winit::dpi::PhysicalSize::new(
-                region.width,
-                region.height,
-            ));
-        let w = match el.create_window(attrs) {
-            Ok(w) => Rc::new(w),
-            Err(e) => { eprintln!("overlay window: {e}"); return; }
-        };
-        let _ = w.set_cursor_hittest(false);
-        let ctx = Context::new(w.clone()).expect("softbuffer ctx");
-        let srf = Surface::new(&ctx, w.clone()).expect("softbuffer surface");
-        // Cut a hole in the window centre so the desktop shows through.
-        set_frame_region(&w, region.width, region.height, CAP_BORDER_W);
-        self.surface = Some(srf);
-        self.context = Some(ctx);
-        self.window = Some(w);
-    }
-
-    // ── Phase transitions ────────────────────────────────────────────────────
-
-    fn enter_capturing(&mut self, el: &ActiveEventLoop, region: Rect) {
-        self.create_overlay_window(el, region);
-        self.create_chat_window(el);
-
-        // Advertise real capture dimensions to connecting clients.
-        if let Some(b) = &self.broadcaster {
-            b.set_stream_dims(region.width, region.height, 30);
-        }
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_thread  = stop.clone();
-        let display      = self.display.clone();
-        let config       = QuadTreeConfig::for_resolution(region.width, region.height);
-        let broadcaster  = self.broadcaster.clone();
-
-        let thread = std::thread::spawn(move || {
-            let mut capturer = match platform::new_capturer(&display, region) {
-                Ok(c) => c,
-                Err(e) => { eprintln!("capture start: {e}"); return; }
-            };
-            let mut detector = DeltaDetector::new(config);
-            let frame_budget = std::time::Duration::from_nanos(1_000_000_000 / 30);
-            while !stop_thread.load(Ordering::Relaxed) {
-                let frame_start = std::time::Instant::now();
-                match capturer.next_frame() {
-                    Ok(frame) => {
-                        let frame = Arc::new(frame);
-                        let dirty = detector.feed(frame.clone());
-                        if !dirty.is_empty() {
-                            if let Some(b) = &broadcaster {
-                                match net::proto::encode_video_frame(&dirty, &frame) {
-                                    Ok(payload) => b.broadcast(Arc::new(net::BroadcastMsg::VideoFrame(Arc::new(payload)))),
-                                    Err(e) => eprintln!("encode error: {e}"),
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("capture error: {e}");
-                        stop_thread.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                }
-                let elapsed = frame_start.elapsed();
-                if elapsed < frame_budget {
-                    std::thread::sleep(frame_budget - elapsed);
-                }
-            }
-        });
-
-        let hook = Hook::install(stop.clone(), self.quit.clone());
-
-        self.phase = Phase::Capturing {
-            stop,
-            thread: Some(thread),
-            hook: Some(hook),
-        };
-    }
-
-    fn enter_selecting(&mut self, el: &ActiveEventLoop) {
-        self.destroy_chat_window();
-        self.chat_input.clear();
-
-        // Capture stopped — reset dims so clients connecting mid-select get zeros.
-        if let Some(b) = &self.broadcaster {
-            b.set_stream_dims(0, 0, 0);
-        }
-
-        // Stop capture cleanly before recreating the selector.
-        if let Phase::Capturing { stop, thread, hook } =
-            std::mem::replace(
-                &mut self.phase,
-                Phase::Selecting {
-                    drag_start: None,
-                    cursor: None,
-                    modifiers: Modifiers::default(),
-                },
-            )
-        {
-            drop(hook); // uninstall keyboard hook first
-            stop.store(true, Ordering::Relaxed);
-            if let Some(h) = thread {
-                let _ = h.join(); // capture thread exits in ≤ 33 ms
-            }
-        }
-        self.create_selector_window(el);
-    }
-
-    // ── Rendering ────────────────────────────────────────────────────────────
-
-    fn render(&mut self) {
-        let (Some(win), Some(srf)) = (&self.window, &mut self.surface) else { return };
-        let sz = win.inner_size();
-        let (Some(nw), Some(nh)) =
-            (NonZeroU32::new(sz.width), NonZeroU32::new(sz.height))
-        else { return };
-        if srf.resize(nw, nh).is_err() { return; }
-        let Ok(mut buf) = srf.buffer_mut() else { return };
-        let (w, h) = (sz.width, sz.height);
-
-        match &self.phase {
-            Phase::Selecting { drag_start, cursor, .. } => {
-                buf.fill(SEL_OVERLAY);
-                if let (Some(a), Some(b)) = (drag_start, cursor) {
-                    let x1 = a.0.min(b.0) as u32;
-                    let y1 = a.1.min(b.1) as u32;
-                    let x2 = (a.0.max(b.0) as u32).min(w.saturating_sub(1));
-                    let y2 = (a.1.max(b.1) as u32).min(h.saturating_sub(1));
-                    for row in y1..=y2 {
-                        let s = (row * w + x1) as usize;
-                        let e = (row * w + x2 + 1).min(buf.len() as u32) as usize;
-                        buf[s..e].fill(SEL_INTERIOR);
-                    }
-                    for col in x1..=x2 {
-                        for d in 0..SEL_BORDER_W {
-                            set_px(&mut buf, w, col, y1 + d, SEL_BORDER);
-                            set_px(&mut buf, w, col, y2.saturating_sub(d), SEL_BORDER);
-                        }
-                    }
-                    for row in y1..=y2 {
-                        for d in 0..SEL_BORDER_W {
-                            set_px(&mut buf, w, x1 + d, row, SEL_BORDER);
-                            set_px(&mut buf, w, x2.saturating_sub(d), row, SEL_BORDER);
-                        }
-                    }
-                }
-            }
-            Phase::Capturing { .. } => {
-                // Fill the whole buffer with cyan. SetWindowRgn has already
-                // punched out the interior, so only the border pixels are visible.
-                buf.fill(CAP_BORDER);
-            }
-        }
-        let _ = buf.present();
-    }
 }
 
 // Punch a rectangular hole in the centre of `window`, leaving only a solid
@@ -591,13 +673,14 @@ fn draw_str(buf: &mut [u32], stride: u32, x: u32, y: u32, s: &str, color: u32) {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
-        self.create_selector_window(el);
+        self.create_selector_windows(el);
     }
 
     fn exiting(&mut self, _el: &ActiveEventLoop) {
-        self.surface = None;
-        self.context = None;
-        self.window  = None;
+        self.destroy_selector_windows();
+        self.cap_surface = None;
+        self.cap_context = None;
+        self.cap_window  = None;
         self.destroy_chat_window();
     }
 
@@ -608,7 +691,8 @@ impl ApplicationHandler for App {
         if let Some(pending) = self.next_phase.take() {
             match pending {
                 PendingPhase::Selecting => self.enter_selecting(el),
-                PendingPhase::Capturing(r) => self.enter_capturing(el, r),
+                PendingPhase::Capturing { display_id, region } =>
+                    self.enter_capturing(el, display_id, region),
             }
         }
 
@@ -638,8 +722,18 @@ impl ApplicationHandler for App {
             }
         }
 
-        if let Some(w) = &self.window {
-            w.request_redraw();
+        // Request redraws on whichever windows are currently active.
+        match &self.phase {
+            Phase::Selecting { .. } => {
+                for sw in &self.sel_wins {
+                    sw.window.request_redraw();
+                }
+            }
+            Phase::Capturing { .. } => {
+                if let Some(w) = &self.cap_window {
+                    w.request_redraw();
+                }
+            }
         }
         if let Some(w) = &self.chat_window {
             w.request_redraw();
@@ -656,8 +750,10 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 if self.is_chat_window(id) {
                     self.render_chat();
+                } else if self.selector_idx_for(id).is_some() {
+                    self.render_selector(id);
                 } else {
-                    self.render();
+                    self.render_cap();
                 }
             }
 
@@ -710,7 +806,7 @@ impl ApplicationHandler for App {
                         }
                         _ => {}
                     }
-                } else if let Phase::Selecting { modifiers, drag_start, cursor } =
+                } else if let Phase::Selecting { modifiers, drag_start, cursor, .. } =
                     &mut self.phase
                 {
                     let ctrl = modifiers.state().contains(ModifiersState::CONTROL);
@@ -718,13 +814,20 @@ impl ApplicationHandler for App {
                         self.quit.store(true, Ordering::Relaxed);
                         return;
                     }
-                    match event.logical_key {
+                    match &event.logical_key {
                         Key::Named(NamedKey::Escape) => {
                             *drag_start = None;
                         }
                         Key::Named(NamedKey::Enter) => {
-                            self.next_phase =
-                                make_capture_phase(*drag_start, *cursor);
+                            // Confirm whichever drag is in progress, regardless of
+                            // which selector window received the keypress.
+                            let display_id = self.sel_wins.iter()
+                                .find(|sw| sw.window.id() == id)
+                                .map(|sw| sw.display_id);
+                            if let Some(display_id) = display_id {
+                                self.next_phase =
+                                    make_capture_phase(display_id, *drag_start, *cursor);
+                            }
                         }
                         _ => {}
                     }
@@ -768,12 +871,24 @@ impl ApplicationHandler for App {
                             }
                         }
                     }
-                } else if let Phase::Selecting { drag_start, cursor, .. } = &mut self.phase {
-                    match state {
-                        ElementState::Pressed => *drag_start = *cursor,
-                        ElementState::Released => {
-                            self.next_phase =
-                                make_capture_phase(*drag_start, *cursor);
+                } else {
+                    // Figure out which display this selector window belongs to.
+                    let display_id = self.sel_wins.iter()
+                        .find(|sw| sw.window.id() == id)
+                        .map(|sw| sw.display_id);
+
+                    if let (Some(display_id), Phase::Selecting { drag_display, drag_start, cursor, .. }) =
+                        (display_id, &mut self.phase)
+                    {
+                        match state {
+                            ElementState::Pressed => {
+                                *drag_display = Some(display_id);
+                                *drag_start   = *cursor;
+                            }
+                            ElementState::Released => {
+                                self.next_phase =
+                                    make_capture_phase(display_id, *drag_start, *cursor);
+                            }
                         }
                     }
                 }
@@ -782,8 +897,10 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 if self.is_chat_window(id) {
                     self.chat_cursor = Some((position.x, position.y));
-                } else if let Phase::Selecting { cursor, .. } = &mut self.phase {
-                    *cursor = Some((position.x, position.y));
+                } else if self.selector_idx_for(id).is_some() {
+                    if let Phase::Selecting { cursor, .. } = &mut self.phase {
+                        *cursor = Some((position.x, position.y));
+                    }
                 }
             }
 
@@ -816,8 +933,9 @@ fn wrap_line(s: &str, max_chars: usize) -> Vec<String> {
 }
 
 fn make_capture_phase(
+    display_id: u32,
     drag_start: Option<(f64, f64)>,
-    cursor: Option<(f64, f64)>,
+    cursor:     Option<(f64, f64)>,
 ) -> Option<PendingPhase> {
     let (a, b) = (drag_start?, cursor?);
     let x1 = a.0.min(b.0) as u32;
@@ -827,7 +945,10 @@ fn make_capture_phase(
     let w = x2.saturating_sub(x1);
     let h = y2.saturating_sub(y1);
     if w < 8 || h < 8 { return None; }
-    Some(PendingPhase::Capturing(Rect::new(x1, y1, w, h)))
+    Some(PendingPhase::Capturing {
+        display_id,
+        region: Rect::new(x1, y1, w, h),
+    })
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
@@ -842,14 +963,14 @@ fn main() {
     let cli = cli::Cli::parse();
 
     match cli.mode {
-        cli::Mode::Host { port, generate_key } => {
+        cli::Mode::Host { port, generate_key, cache_secs } => {
             if generate_key {
                 match identity::run_keygen_wizard() {
                     Ok(_) => {}
                     Err(e) => { eprintln!("keygen: {e}"); return; }
                 }
             }
-            run_host_gui(port);
+            run_host_gui(port, cache_secs);
         }
 
         cli::Mode::Client { host, port, name } => {
@@ -858,7 +979,7 @@ fn main() {
     }
 }
 
-fn run_host_gui(port: u16) {
+fn run_host_gui(port: u16, cache_secs: f32) {
     // Load host fingerprint for the handshake (empty string if no identity generated yet).
     let host_fp = identity::load_fingerprint().unwrap_or_default();
     let host_display_name = if host_fp.is_empty() {
@@ -880,7 +1001,7 @@ fn run_host_gui(port: u16) {
         }
     };
 
-    let broadcaster = net::Broadcaster::new(host_fp, sample_rate, channels);
+    let broadcaster = net::Broadcaster::new(host_fp, sample_rate, channels, cache_secs);
 
     // Wire up the host chat channel before accepting any clients.
     let (chat_tx, chat_rx) = mpsc::channel::<(String, String)>();
@@ -908,30 +1029,27 @@ fn run_host_gui(port: u16) {
             .ok();
     }
 
-    println!("Screen Party — hosting on port {port}");
-    println!("  Drag to select a region, release to start capture");
-    println!("  Esc Esc  — stop capture and reselect");
-    println!("  Ctrl+Q   — quit");
-
     let displays = match platform::list_displays() {
         Ok(d) if !d.is_empty() => d,
         Ok(_) => { eprintln!("no displays found"); return; }
         Err(e) => { eprintln!("display enum: {e}"); return; }
     };
+    println!("Screen Party — hosting on port {port}");
+    println!("  Drag to select a region on any display, release to start capture");
+    println!("  Esc Esc  — stop capture and reselect");
+    println!("  Ctrl+Q   — quit");
     for d in &displays {
         println!(
-            "  Display {}: {} ({}×{}){}",
-            d.id, d.name, d.width, d.height,
+            "  Display {}: {} ({}×{} at {},{}){}",
+            d.id, d.name, d.width, d.height, d.x, d.y,
             if d.primary { " [primary]" } else { "" }
         );
     }
-    let display = displays.into_iter().find(|d| d.primary)
-        .unwrap_or_else(|| panic!("no primary display"));
 
     let mut event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::new(display, Some(broadcaster), Some(chat_rx), host_display_name, host_fingerprint);
+    let mut app = App::new(displays, Some(broadcaster), Some(chat_rx), host_display_name, host_fingerprint);
     event_loop.run_app_on_demand(&mut app).ok();
     println!("Goodbye.");
 }

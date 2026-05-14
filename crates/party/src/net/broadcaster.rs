@@ -6,7 +6,7 @@
 //!   3. Approval   — if `--approve` is set, host must type /approve <fp8> in chat
 //!   4. STREAM_INFO — codec/format metadata                  (encrypted)
 //!   5. Split threads:
-//!      • Send loop  — BroadcastMsgs → socket  (main client thread, encrypted)
+//!      • Send loop  — ring reader (A/V) + control channel (chat/disconnect)
 //!      • Read loop  — incoming CHAT_MSG → re-broadcast to all  (spawned, encrypted)
 
 use std::io::{self, BufReader, BufWriter, Write};
@@ -19,6 +19,7 @@ use std::sync::{
 use std::time::Duration;
 
 use super::cipher::{EncryptedReader, EncryptedWriter, EphemeralKeypair, Role};
+use super::stream_cache::{CacheEntry, StreamCache};
 use super::{proto, speed_test};
 
 // ── Public message types ──────────────────────────────────────────────────────
@@ -42,6 +43,7 @@ struct ClientHandle {
     id:          u64,
     name:        String,
     fingerprint: String,
+    /// Control channel: only Chat and Disconnect messages travel here.
     tx:          SyncSender<Arc<BroadcastMsg>>,
 }
 
@@ -52,9 +54,8 @@ struct PendingEntry {
     decision_tx: mpsc::SyncSender<ApprovalDecision>,
 }
 
-// Messages buffered per client before dropping. Sized for a full GOP worth of
-// video at 30 fps plus headroom for interleaved audio chunks.
-const QUEUE_DEPTH: usize = 16;
+// Control-message queue depth per client (chat + disconnect only; A/V go through ring).
+const CTRL_QUEUE: usize = 8;
 
 // ── Broadcaster ───────────────────────────────────────────────────────────────
 
@@ -69,6 +70,8 @@ pub struct Broadcaster {
     next_id:      AtomicU64,
     /// Forward incoming chat + system events to the host UI.
     chat_notify:  Arc<Mutex<Option<mpsc::Sender<(String, String)>>>>,
+    /// Shared ring buffer of encoded A/V payloads.
+    cache:        Arc<StreamCache>,
 }
 
 impl Broadcaster {
@@ -76,7 +79,11 @@ impl Broadcaster {
         host_fingerprint: String,
         sample_rate:      u32,
         channels:         u16,
+        cache_secs:       f32,
     ) -> Arc<Self> {
+        // Capacity: cache_secs × 250 entries/sec covers 30 fps video plus
+        // audio at up to ~220 chunks/sec (48 kHz / 216 samples), with margin.
+        let capacity = ((cache_secs * 250.0).ceil() as usize).max(64);
         Arc::new(Self {
             host_fingerprint,
             sample_rate,
@@ -86,6 +93,7 @@ impl Broadcaster {
             pending:     Arc::new(Mutex::new(Vec::new())),
             next_id:     AtomicU64::new(1),
             chat_notify: Arc::new(Mutex::new(None)),
+            cache:       StreamCache::new(capacity),
         })
     }
 
@@ -97,16 +105,30 @@ impl Broadcaster {
             .expect("listener thread");
     }
 
+    /// Route an outgoing message to all clients.
+    ///
+    /// `VideoFrame` and `AudioChunk` are written into the shared ring buffer;
+    /// `ChatMessage` and `Disconnect` are sent on each client's control channel.
     pub fn broadcast(&self, msg: Arc<BroadcastMsg>) {
-        let mut clients = self.clients.lock().unwrap();
-        clients.retain(|c| match c.tx.try_send(msg.clone()) {
-            Ok(_) => true,
-            Err(mpsc::TrySendError::Full(_)) => {
-                eprintln!("[net] client {} slow, frame dropped", c.id);
-                true
+        match msg.as_ref() {
+            BroadcastMsg::VideoFrame(payload) => {
+                self.cache.push(CacheEntry::Video(payload.clone()));
             }
-            Err(mpsc::TrySendError::Disconnected(_)) => false,
-        });
+            BroadcastMsg::AudioChunk(payload) => {
+                self.cache.push(CacheEntry::Audio(payload.clone()));
+            }
+            BroadcastMsg::ChatMessage { .. } | BroadcastMsg::Disconnect => {
+                let mut clients = self.clients.lock().unwrap();
+                clients.retain(|c| match c.tx.try_send(msg.clone()) {
+                    Ok(_) => true,
+                    Err(mpsc::TrySendError::Full(_)) => {
+                        eprintln!("[net] client {} control queue full, msg dropped", c.id);
+                        true
+                    }
+                    Err(mpsc::TrySendError::Disconnected(_)) => false,
+                });
+            }
+        }
     }
 
     pub fn set_stream_dims(&self, width: u32, height: u32, fps: u8) {
@@ -313,7 +335,7 @@ fn run_client(
     )?;
 
     // ── Register + split send / read threads ──────────────────────────────────
-    let (tx, rx) = mpsc::sync_channel::<Arc<BroadcastMsg>>(QUEUE_DEPTH);
+    let (tx, rx) = mpsc::sync_channel::<Arc<BroadcastMsg>>(CTRL_QUEUE);
     broadcaster.clients.lock().unwrap().push(ClientHandle {
         id,
         name:        client_name,
@@ -336,35 +358,63 @@ fn run_client(
         })
         .ok();
 
-    // Send loop: fan-out encrypted messages to this client (blocks until client leaves).
-    let result = send_loop(&mut w, rx);
+    // Send loop: ring reader (A/V) + control channel (chat/disconnect).
+    let result = send_loop(&mut w, rx, broadcaster.cache.clone());
     sys_notify(&broadcaster.chat_notify, format!("[LEFT] {display_name} disconnected"));
     result
 }
 
-fn send_loop(w: &mut impl Write, rx: mpsc::Receiver<Arc<BroadcastMsg>>) -> io::Result<()> {
-    for msg in rx {
-        match msg.as_ref() {
-            BroadcastMsg::VideoFrame(payload) => {
-                proto::write_msg(w, proto::msg::VIDEO_FRAME, payload)?;
+fn send_loop(
+    w:     &mut impl Write,
+    rx:    mpsc::Receiver<Arc<BroadcastMsg>>,
+    cache: Arc<StreamCache>,
+) -> io::Result<()> {
+    // Seed the client with the full ring tail so their playback buffer is
+    // primed before going live — eliminates the blank "connecting" wait.
+    let (tail, mut cursor) = cache.snapshot_tail(usize::MAX);
+    for entry in &tail {
+        match entry.as_ref() {
+            CacheEntry::Video(p) => proto::write_msg(w, proto::msg::VIDEO_FRAME, p)?,
+            CacheEntry::Audio(p) => proto::write_msg(w, proto::msg::AUDIO_CHUNK, p)?,
+        }
+    }
+    w.flush()?;
+
+    loop {
+        // Service pending control messages (chat, disconnect) without blocking.
+        loop {
+            match rx.try_recv() {
+                Ok(msg) => match msg.as_ref() {
+                    BroadcastMsg::ChatMessage { sender, text } => {
+                        proto::write_msg(
+                            w,
+                            proto::msg::CHAT_MSG,
+                            &proto::encode_chat_msg(sender, text),
+                        )?;
+                        w.flush()?;
+                    }
+                    BroadcastMsg::Disconnect => {
+                        proto::write_msg(w, proto::msg::DISCONNECT, b"")?;
+                        return Ok(());
+                    }
+                    _ => {}
+                },
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
             }
-            BroadcastMsg::AudioChunk(samples) => {
-                proto::write_msg(w, proto::msg::AUDIO_CHUNK, samples)?;
-            }
-            BroadcastMsg::ChatMessage { sender, text } => {
-                proto::write_msg(
-                    w,
-                    proto::msg::CHAT_MSG,
-                    &proto::encode_chat_msg(sender, text),
-                )?;
-            }
-            BroadcastMsg::Disconnect => {
-                proto::write_msg(w, proto::msg::DISCONNECT, b"")?;
-                return Ok(());
+        }
+
+        // Block on ring with a short timeout so we revisit the control channel
+        // promptly even when no A/V is flowing.
+        let (entries, new_cursor) = cache.wait_from(cursor, Duration::from_millis(20));
+        cursor = new_cursor;
+        for entry in &entries {
+            match entry.as_ref() {
+                CacheEntry::Video(p) => proto::write_msg(w, proto::msg::VIDEO_FRAME, p)?,
+                CacheEntry::Audio(p) => proto::write_msg(w, proto::msg::AUDIO_CHUNK, p)?,
             }
         }
     }
-    Ok(())
 }
 
 fn client_read_loop(

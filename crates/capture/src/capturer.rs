@@ -16,6 +16,9 @@ pub enum CaptureError {
 pub struct DisplayInfo {
     pub id: u32,
     pub name: String,
+    /// Position of the display's top-left corner in the virtual desktop.
+    pub x: i32,
+    pub y: i32,
     pub width: u32,
     pub height: u32,
     /// True if this is the primary display.

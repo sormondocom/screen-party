@@ -73,9 +73,32 @@ Type any of these in the host chat window and press Enter:
 ### 4. Host options
 
 ```
-party host --port 8888    # listen on a different port (default: 7777)
-party host --generate-key # create or replace your PGP identity
+party host --port 8888          # listen on a different port (default: 7777)
+party host --generate-key       # create or replace your PGP identity
+party host --cache-secs 5       # shrink the stream cache (default: 10 s, see below)
 ```
+
+### 5. Stream cache (`--cache-secs`)
+
+The host keeps a rolling ring buffer of the last N seconds of encoded video and audio. New clients receive this buffer immediately on connect — eliminating the blank "connecting" wait and pre-seeding their playback buffer before going live. Slow clients read the ring at their own pace without causing anyone else to drop frames.
+
+**Memory budget**
+
+The cache holds zstd-compressed delta frames and raw f32 audio. How much RAM it uses depends almost entirely on screen activity — the quadtree encoder only transmits changed pixels, so a static screen costs nearly nothing.
+
+| Sharing scenario | ~MB per second | ~MB at default (10 s) |
+|---|---|---|
+| Static / mostly-static screen | < 1 | < 10 |
+| Code editing, slides, documents | 1–5 | 10–55 |
+| Scrolling, UI animations | 5–20 | 55–205 |
+| Full-screen HD video playback | 50–100 | 500–1,000 |
+
+Audio adds a flat ~0.4 MB/s in all cases (raw f32 PCM at 48 kHz stereo) and can be ignored in any budget calculation.
+
+**Rules of thumb:**
+- **Presentation or code sharing** — the default `--cache-secs 10` uses roughly **20–100 MB**. No tuning needed.
+- **Full-screen video content** — drop to `--cache-secs 2` or `3` to stay under ~100 MB.
+- **Low-memory host (< 2 GB RAM)** — `--cache-secs 3` is a safe ceiling for any content type.
 
 ---
 
@@ -172,6 +195,7 @@ Type the command in the chat window and press Enter. The client waits up to 5 mi
 - **System audio** — Windows WASAPI loopback capture; no virtual cable needed
 - **Multi-client fanout** — one host, unlimited simultaneous viewers
 - **Bidirectional chat** — host and all viewers share a single chat room
+- **Host-side stream cache** — rolling ring buffer of encoded frames; new clients are seeded with the tail before going live; slow clients read at their own pace without affecting others
 - **Speed probe** — jitter-measured pre-buffering sized to actual link conditions
 - **Video playback buffer** — client-side frame queue absorbs network jitter; prebuffer depth auto-sized from the speed probe; hard ceiling drops oldest frames to stay within ~4 s of live
 - **Viewer reconnect** — re-select region with double-Esc without restarting the host

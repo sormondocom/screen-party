@@ -58,11 +58,15 @@ pub(super) fn list_displays() -> Result<Vec<DisplayInfo>, CaptureError> {
                     &raw[..raw.iter().position(|&c| c == 0).unwrap_or(raw.len())],
                 );
                 displays.push(DisplayInfo {
-                    id: global_id,
+                    id:      global_id,
                     name,
-                    width: (r.right - r.left) as u32,
-                    height: (r.bottom - r.top) as u32,
-                    primary: global_id == 0,
+                    x:       r.left,
+                    y:       r.top,
+                    width:   (r.right  - r.left) as u32,
+                    height:  (r.bottom - r.top)  as u32,
+                    // The primary monitor always has its top-left at the virtual
+                    // desktop origin on Windows.
+                    primary: r.left == 0 && r.top == 0,
                 });
                 global_id += 1;
             }
