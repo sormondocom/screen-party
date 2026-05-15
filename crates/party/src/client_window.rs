@@ -357,11 +357,13 @@ impl ClientApp {
             }
             if panel_y > 60 && self.prebuffer_target > 0 {
                 let pct = (self.video_queue.len() * 100 / self.prebuffer_target).min(100);
+                let cache_secs = self.prebuffer_target as f32 / self.playback_fps.max(1) as f32;
                 let label = format!(
-                    "Buffering… {}% ({}/{})",
+                    "Buffering… {}% ({}/{} frames, {:.0}s required from host buffer)",
                     pct,
                     self.video_queue.len(),
                     self.prebuffer_target,
+                    cache_secs,
                 );
                 draw_str(&mut buf, w, 20, panel_y / 2 - 20, &label, COLOR_TEXT);
 
