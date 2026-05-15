@@ -58,6 +58,8 @@ struct ClientApp {
     stream_h:     u32,
     video_buf:    Vec<u32>, // 0x00RRGGBB, stream_w * stream_h pixels
     audio_out:    Option<CpalPlayer>,
+    audio_format: Option<(u32, u16)>,  // (sample_rate, channels) — set on StreamInfo
+    audio_prebuf: Vec<Vec<f32>>,       // audio held until video prebuffer is satisfied
     // Video playback buffer
     video_queue:      VecDeque<DecodedFrame>,
     video_queue_cap:  usize,  // sized from host cache_secs on StreamInfo
@@ -100,6 +102,8 @@ impl ClientApp {
             stream_h:        0,
             video_buf:       Vec::new(),
             audio_out:       None,
+            audio_format:    None,
+            audio_prebuf:    Vec::new(),
             video_queue:      VecDeque::new(),
             video_queue_cap:  VIDEO_QUEUE_DEFAULT,
             playback_fps:     30,
@@ -169,6 +173,19 @@ impl ClientApp {
             }
             self.prebuffering = false;
             self.next_frame_due = Instant::now();
+            // Open audio and flush the pre-buffered chunks so it starts
+            // in lock-step with the first video frame.
+            if let Some((sr, ch)) = self.audio_format {
+                match CpalPlayer::new(sr, ch, 0) {
+                    Ok(player) => {
+                        for chunk in self.audio_prebuf.drain(..) {
+                            player.push(chunk);
+                        }
+                        self.audio_out = Some(player);
+                    }
+                    Err(e) => eprintln!("[audio] output unavailable: {e}"),
+                }
+            }
         }
 
         let now = Instant::now();
@@ -228,12 +245,11 @@ impl ClientApp {
                     // On internet (buffer_ms ≈ 500 ms) → 15 frames (~500 ms).
                     self.prebuffer_target = ((buffer_ms * self.playback_fps as u64 + 999) / 1000)
                         .clamp(1, (self.video_queue_cap / 2) as u64) as usize;
-                    // Open audio output pre-buffered to absorb the measured jitter.
-                    let prebuf = (sample_rate as u64 * channels as u64 * buffer_ms / 1000) as usize;
-                    match CpalPlayer::new(sample_rate, channels, prebuf) {
-                        Ok(player) => self.audio_out = Some(player),
-                        Err(e) => eprintln!("[audio] output unavailable: {e}"),
-                    }
+                    // Defer audio output creation until the video prebuffer is
+                    // satisfied so audio and video start at the same instant.
+                    self.audio_out    = None;
+                    self.audio_format = Some((sample_rate, channels as u16));
+                    self.audio_prebuf.clear();
                 }
 
                 ClientEvent::VideoFrame(frame) => {
@@ -247,7 +263,10 @@ impl ClientApp {
                 }
 
                 ClientEvent::AudioChunk(samples) => {
-                    if let Some(player) = &self.audio_out {
+                    if self.prebuffering {
+                        // Hold audio until video is ready so they start together.
+                        self.audio_prebuf.push(samples);
+                    } else if let Some(player) = &self.audio_out {
                         player.push(samples);
                     }
                 }
