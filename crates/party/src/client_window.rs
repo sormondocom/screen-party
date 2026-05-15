@@ -460,11 +460,14 @@ impl ApplicationHandler for ClientApp {
         }
 
         // Sleep until the next frame deadline so we don't spin the CPU.
-        // During prebuffering, check every 5 ms for enough frames to arrive.
+        // Cap at 10 ms so audio chunks are forwarded to CpalPlayer frequently
+        // enough to keep the CPAL accumulator fed (callback period ~10 ms).
+        // During prebuffering, check every 5 ms for enough video frames.
+        let soon = std::time::Instant::now() + Duration::from_millis(10);
         let wake_at = if self.prebuffering {
             std::time::Instant::now() + Duration::from_millis(5)
         } else {
-            self.next_frame_due
+            self.next_frame_due.min(soon)
         };
         el.set_control_flow(ControlFlow::WaitUntil(wake_at));
     }
