@@ -25,9 +25,24 @@ pub struct SpeedStats {
 }
 
 impl SpeedStats {
-    /// Recommended client-side buffer depth: 3σ jitter, clamped to [100, 2000] ms.
+    /// Recommended client-side buffer depth: 3σ jitter, with a throughput-derived
+    /// floor so fast links need minimal buffering and slow links get a meaningful
+    /// safety margin automatically.
+    ///
+    /// Floor = time to receive one typical compressed frame (~32 KB) at the
+    /// measured throughput.  Examples:
+    ///   • 100 MB/s LAN  → ~0.3 ms  → effectively 1 ms
+    ///   •  10 MB/s WiFi → ~3.2 ms
+    ///   •   1 MB/s      → ~32  ms
+    ///   • 100 KB/s      → ~320 ms
     pub fn recommended_buffer_ms(&self) -> u64 {
-        ((self.jitter_ms * 3.0).ceil() as u64).clamp(100, 2_000)
+        let jitter_ms = (self.jitter_ms * 3.0).ceil() as u64;
+        let speed_floor_ms = if self.throughput_bps > 0 {
+            (32_000u64 * 1_000 / self.throughput_bps).clamp(1, 1_000)
+        } else {
+            500
+        };
+        jitter_ms.max(speed_floor_ms).clamp(1, 2_000)
     }
 
     /// True if the link is stable enough for comfortable streaming.

@@ -63,6 +63,7 @@ pub struct Broadcaster {
     host_fingerprint: String,
     sample_rate:      u32,
     channels:         u16,
+    cache_secs:       f32,
     /// Actual capture region dimensions and fps; (0,0,0) while no region is selected.
     stream_dims:  Mutex<(u32, u32, u8)>,
     clients:      Arc<Mutex<Vec<ClientHandle>>>,
@@ -88,6 +89,7 @@ impl Broadcaster {
             host_fingerprint,
             sample_rate,
             channels,
+            cache_secs,
             stream_dims: Mutex::new((0, 0, 0)),
             clients:     Arc::new(Mutex::new(Vec::new())),
             pending:     Arc::new(Mutex::new(Vec::new())),
@@ -331,7 +333,12 @@ fn run_client(
     proto::write_msg(
         &mut w,
         proto::msg::STREAM_INFO,
-        &proto::encode_stream_info(sw, sh, sfps, broadcaster.sample_rate, broadcaster.channels as u8),
+        &proto::encode_stream_info(
+            sw, sh, sfps,
+            broadcaster.sample_rate,
+            broadcaster.channels as u8,
+            broadcaster.cache_secs,
+        ),
     )?;
 
     // ── Register + split send / read threads ──────────────────────────────────

@@ -31,9 +31,9 @@ const CHAT_LINES:  usize = 28;
 const CHAT_PAD:    u32 = 8;
 const CHAT_HEIGHT: u32 = CHAT_PAD * 2 + (CHAT_LINES as u32 + 2) * CHAR_H + 4;
 
-// Hard ceiling on the decode queue. Frames beyond this are dropped
-// oldest-first so the viewer stays within ~4 s of live content.
-const VIDEO_MAX_QUEUE: usize = 120;
+// Default video queue capacity before StreamInfo arrives. Overridden once the
+// host's cache_secs is known; see ClientApp::video_queue_cap.
+const VIDEO_QUEUE_DEFAULT: usize = 120;
 
 const COLOR_BG:       u32 = 0x00_1A_1A_2E;
 const COLOR_TEXT:     u32 = 0x00_E0_E0_E0;
@@ -60,6 +60,7 @@ struct ClientApp {
     audio_out:    Option<CpalPlayer>,
     // Video playback buffer
     video_queue:      VecDeque<DecodedFrame>,
+    video_queue_cap:  usize,  // sized from host cache_secs on StreamInfo
     playback_fps:     u8,
     next_frame_due:   Instant,
     prebuffering:     bool,
@@ -100,6 +101,7 @@ impl ClientApp {
             video_buf:       Vec::new(),
             audio_out:       None,
             video_queue:      VecDeque::new(),
+            video_queue_cap:  VIDEO_QUEUE_DEFAULT,
             playback_fps:     30,
             next_frame_due:   Instant::now(),
             prebuffering:     true,
@@ -198,7 +200,7 @@ impl ClientApp {
     fn drain_events(&mut self) {
         while let Ok(ev) = self.event_rx.try_recv() {
             match ev {
-                ClientEvent::StreamInfo { width, height, fps, sample_rate, channels, buffer_ms } => {
+                ClientEvent::StreamInfo { width, height, fps, sample_rate, channels, buffer_ms, cache_secs } => {
                     // Only resize the video buffer if dims are non-zero.
                     // Clients that connected before the host selected a region
                     // will get zeros here and rely on VideoFrame lazy init instead.
@@ -216,12 +218,16 @@ impl ClientApp {
                     self.playback_fps = fps.max(1);
                     self.video_queue.clear();
                     self.prebuffering = true;
+                    // Size the video queue to hold the full pre-seeded cache tail plus
+                    // a live-playback cushion. Cap at 10× the FPS to stay reasonable.
+                    self.video_queue_cap = ((cache_secs * self.playback_fps as f32).ceil() as usize)
+                        .max(VIDEO_QUEUE_DEFAULT);
                     // Size the prebuffer to absorb the measured link jitter:
-                    //   frames = ceil(buffer_ms * fps / 1000), clamped to [2, max/2].
-                    // On LAN (buffer_ms ≈ 5 ms, fps=30) → 1 → clamped to 2 frames (~67 ms).
+                    //   frames = ceil(buffer_ms * fps / 1000), clamped to [1, queue_cap/2].
+                    // On LAN (buffer_ms ≈ 3 ms, fps=30) → 1 frame (~33 ms).
                     // On internet (buffer_ms ≈ 500 ms) → 15 frames (~500 ms).
                     self.prebuffer_target = ((buffer_ms * self.playback_fps as u64 + 999) / 1000)
-                        .clamp(2, (VIDEO_MAX_QUEUE / 2) as u64) as usize;
+                        .clamp(1, (self.video_queue_cap / 2) as u64) as usize;
                     // Open audio output pre-buffered to absorb the measured jitter.
                     let prebuf = (sample_rate as u64 * channels as u64 * buffer_ms / 1000) as usize;
                     match CpalPlayer::new(sample_rate, channels, prebuf) {
@@ -232,8 +238,8 @@ impl ClientApp {
 
                 ClientEvent::VideoFrame(frame) => {
                     // Drop the oldest frame if the queue is at its hard ceiling,
-                    // keeping the viewer within VIDEO_MAX_QUEUE frames of live.
-                    if self.video_queue.len() >= VIDEO_MAX_QUEUE {
+                    // keeping the viewer within video_queue_cap frames of live.
+                    if self.video_queue.len() >= self.video_queue_cap {
                         self.video_queue.pop_front();
                     }
                     self.video_queue.push_back(frame);
@@ -452,6 +458,15 @@ impl ApplicationHandler for ClientApp {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
+
+        // Sleep until the next frame deadline so we don't spin the CPU.
+        // During prebuffering, check every 5 ms for enough frames to arrive.
+        let wake_at = if self.prebuffering {
+            std::time::Instant::now() + Duration::from_millis(5)
+        } else {
+            self.next_frame_due
+        };
+        el.set_control_flow(ControlFlow::WaitUntil(wake_at));
     }
 
     fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -576,7 +591,7 @@ pub fn run(host: &str, port: u16, name: Option<String>) {
         .expect("net-client thread");
 
     let mut event_loop = EventLoop::new().expect("event loop");
-    event_loop.set_control_flow(ControlFlow::Poll);
+    event_loop.set_control_flow(ControlFlow::WaitUntil(std::time::Instant::now()));
     let mut app = ClientApp::new(event_rx, send_tx, client_fp);
     event_loop.run_app_on_demand(&mut app).ok();
 }

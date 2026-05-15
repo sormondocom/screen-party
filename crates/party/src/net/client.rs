@@ -19,6 +19,8 @@ pub enum ClientEvent {
         sample_rate: u32,
         channels:    u16,
         buffer_ms:   u64,
+        /// Host ring-buffer depth; used to size the client's video playback queue.
+        cache_secs:  f32,
     },
     VideoFrame(proto::DecodedFrame),
     AudioChunk(Vec<f32>),
@@ -174,6 +176,7 @@ pub fn run_network(
         sample_rate: info.sample_rate,
         channels:    info.channels as u16,
         buffer_ms:   stats.recommended_buffer_ms(),
+        cache_secs:  info.cache_secs,
     });
 
     // ── Split write thread ────────────────────────────────────────────────────

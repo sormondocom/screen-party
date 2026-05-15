@@ -172,14 +172,19 @@ pub fn decode_speed_report(p: &[u8]) -> io::Result<SpeedReport> {
 
 // ── Stream info (host → client) ───────────────────────────────────────────────
 
-/// `[u32 width][u32 height][u8 fps][u32 sample_rate][u8 channels]`
-pub fn encode_stream_info(width: u32, height: u32, fps: u8, sample_rate: u32, channels: u8) -> Vec<u8> {
-    let mut b = Vec::with_capacity(14);
+/// `[u32 width][u32 height][u8 fps][u32 sample_rate][u8 channels][f32 cache_secs]`
+pub fn encode_stream_info(
+    width: u32, height: u32, fps: u8,
+    sample_rate: u32, channels: u8,
+    cache_secs: f32,
+) -> Vec<u8> {
+    let mut b = Vec::with_capacity(18);
     b.extend_from_slice(&width.to_le_bytes());
     b.extend_from_slice(&height.to_le_bytes());
     b.push(fps);
     b.extend_from_slice(&sample_rate.to_le_bytes());
     b.push(channels);
+    b.extend_from_slice(&cache_secs.to_le_bytes());
     b
 }
 
@@ -189,16 +194,19 @@ pub struct StreamInfo {
     pub fps: u8,
     pub sample_rate: u32,
     pub channels: u8,
+    /// Host's ring-buffer depth in seconds; informs client video-queue sizing.
+    pub cache_secs: f32,
 }
 
 pub fn decode_stream_info(p: &[u8]) -> io::Result<StreamInfo> {
-    if p.len() < 14 { return Err(bad("stream info too short")); }
+    if p.len() < 18 { return Err(bad("stream info too short")); }
     Ok(StreamInfo {
         width:       u32::from_le_bytes(p[0..4].try_into().unwrap()),
         height:      u32::from_le_bytes(p[4..8].try_into().unwrap()),
         fps:         p[8],
         sample_rate: u32::from_le_bytes(p[9..13].try_into().unwrap()),
         channels:    p[13],
+        cache_secs:  f32::from_le_bytes(p[14..18].try_into().unwrap()),
     })
 }
 
