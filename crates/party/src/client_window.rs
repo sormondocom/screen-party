@@ -243,7 +243,7 @@ impl ClientApp {
     fn drain_events(&mut self) {
         while let Ok(ev) = self.event_rx.try_recv() {
             match ev {
-                ClientEvent::StreamInfo { width, height, fps, sample_rate, channels, buffer_ms, cache_secs } => {
+                ClientEvent::StreamInfo { width, height, fps, sample_rate, channels, buffer_ms: _, cache_secs } => {
                     // Only resize the video buffer if dims are non-zero.
                     // Clients that connected before the host selected a region
                     // will get zeros here and rely on VideoFrame lazy init instead.
@@ -266,16 +266,13 @@ impl ClientApp {
                     self.prebuffering = true;
                     self.audio_base_pts     = 0;
                     self.audio_base_samples = 0;
-                    // Size the video queue to hold the full pre-seeded cache tail plus
-                    // a live-playback cushion. Cap at 10× the FPS to stay reasonable.
-                    self.video_queue_cap = ((cache_secs * self.playback_fps as f32).ceil() as usize)
-                        .max(VIDEO_QUEUE_DEFAULT);
-                    // Size the prebuffer to absorb the measured link jitter:
-                    //   frames = ceil(buffer_ms * fps / 1000), clamped to [1, queue_cap/2].
-                    // On LAN (buffer_ms ≈ 3 ms, fps=30) → 1 frame (~33 ms).
-                    // On internet (buffer_ms ≈ 500 ms) → 15 frames (~500 ms).
-                    self.prebuffer_target = ((buffer_ms * self.playback_fps as u64 + 999) / 1000)
-                        .clamp(1, (self.video_queue_cap / 2) as u64) as usize;
+                    // Prebuffer = full cache depth so the client always starts with a
+                    // complete buffer already filled; live frames accumulate behind it.
+                    // Queue cap = 2× prebuffer so live content has room alongside the
+                    // prebuffered frames without triggering drops.
+                    let frames_in_cache = (cache_secs * self.playback_fps as f32).ceil() as usize;
+                    self.prebuffer_target = frames_in_cache.max(1);
+                    self.video_queue_cap  = (frames_in_cache * 2).max(VIDEO_QUEUE_DEFAULT);
                     // Defer audio output creation until the video prebuffer is
                     // satisfied so audio and video start at the same instant.
                     self.audio_out = None;
@@ -350,6 +347,38 @@ impl ClientApp {
             }
             if panel_y > 20 {
                 draw_str(&mut buf, w, 20, 20, "Connecting...", COLOR_TEXT);
+            }
+        } else if self.prebuffering {
+            // Stream dimensions are known but we're still filling the buffer.
+            // Fill video area dark and show a progress bar + percentage.
+            for row in 0..panel_y as usize {
+                let base = row * w as usize;
+                buf[base..base + w as usize].fill(0x00_11_11_11);
+            }
+            if panel_y > 60 && self.prebuffer_target > 0 {
+                let pct = (self.video_queue.len() * 100 / self.prebuffer_target).min(100);
+                let label = format!(
+                    "Buffering… {}% ({}/{})",
+                    pct,
+                    self.video_queue.len(),
+                    self.prebuffer_target,
+                );
+                draw_str(&mut buf, w, 20, panel_y / 2 - 20, &label, COLOR_TEXT);
+
+                // Progress bar: full width minus margins, 8px tall.
+                let bar_x  = 20u32;
+                let bar_y  = panel_y / 2;
+                let bar_w  = w.saturating_sub(40);
+                let bar_h  = 8u32;
+                let filled = (bar_w as usize * pct / 100) as u32;
+                for dy in 0..bar_h {
+                    let row_y = bar_y + dy;
+                    if row_y >= panel_y { break; }
+                    for dx in 0..bar_w {
+                        let color = if dx < filled { 0x00_00_E5_FF } else { 0x00_33_33_33 };
+                        set_px(&mut buf, w, bar_x + dx, row_y, color);
+                    }
+                }
             }
         } else {
             // Precompute source column indices once per row to halve divisions.
