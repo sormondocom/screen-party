@@ -58,20 +58,24 @@ struct ClientApp {
     stream_w:     u32,
     stream_h:     u32,
     video_buf:    Vec<u32>, // 0x00RRGGBB, stream_w * stream_h pixels
-    audio_out:    Option<CpalPlayer>,
-    audio_format: Option<(u32, u16)>,  // (sample_rate, channels) — set on StreamInfo
-    audio_prebuf: Vec<Vec<f32>>,       // audio held until video prebuffer is satisfied
+    audio_out:        Option<CpalPlayer>,
+    audio_sample_rate: u32,
+    audio_channels:    u32,
+    /// Audio chunks buffered until the video prebuffer is satisfied.
+    /// Each entry is (pts_us, samples) using the host's shared A/V clock.
+    audio_prebuf:     Vec<(u64, Vec<f32>)>,
+    /// pts_us of the first audio chunk pushed to CpalPlayer — the audio clock origin.
+    audio_base_pts:   u64,
+    /// samples_played value when audio_base_pts was established.
+    audio_base_samples: u64,
     // Video playback buffer
-    video_queue:           VecDeque<DecodedFrame>,
-    video_queue_cap:       usize,  // sized from host cache_secs on StreamInfo
-    playback_fps:          u8,
-    // Audio-driven A/V sync: video frame N is shown when samples_played >= N * spf.
-    audio_samples_per_frame: f64,  // sample_rate * channels / fps
-    video_frames_shown:    u64,
+    video_queue:      VecDeque<DecodedFrame>,
+    video_queue_cap:  usize,  // sized from host cache_secs on StreamInfo
+    playback_fps:     u8,
     // Wall-clock fallback used only when audio output is unavailable.
-    next_frame_due:        Instant,
-    prebuffering:          bool,
-    prebuffer_target:      usize, // frames to accumulate before first display (from speed-test)
+    next_frame_due:   Instant,
+    prebuffering:     bool,
+    prebuffer_target: usize, // frames to accumulate before first display (from speed-test)
     // Identity
     client_fp:    String,
     host_fp:      String,
@@ -105,18 +109,19 @@ impl ClientApp {
             send_tx,
             stream_w:        0,
             stream_h:        0,
-            video_buf:       Vec::new(),
-            audio_out:       None,
-            audio_format:    None,
-            audio_prebuf:    Vec::new(),
-            video_queue:             VecDeque::new(),
-            video_queue_cap:         VIDEO_QUEUE_DEFAULT,
-            playback_fps:            30,
-            audio_samples_per_frame: 3200.0, // 48000 * 2 / 30 — updated on StreamInfo
-            video_frames_shown:      0,
-            next_frame_due:          Instant::now(),
-            prebuffering:            true,
-            prebuffer_target:        1,
+            video_buf:          Vec::new(),
+            audio_out:          None,
+            audio_sample_rate:  48_000,
+            audio_channels:     2,
+            audio_prebuf:       Vec::new(),
+            audio_base_pts:     0,
+            audio_base_samples: 0,
+            video_queue:        VecDeque::new(),
+            video_queue_cap:    VIDEO_QUEUE_DEFAULT,
+            playback_fps:       30,
+            next_frame_due:     Instant::now(),
+            prebuffering:       true,
+            prebuffer_target:   1,
             client_fp,
             host_fp:         String::new(),
             host_trusted:    None,
@@ -168,12 +173,12 @@ impl ClientApp {
     //
     // Timing:
     //   • Prebuffering: accumulate video and audio together; release both at once.
-    //   • Audio-driven: frame N is displayed when CpalPlayer has consumed
-    //     N × (sample_rate × channels / fps) interleaved f32 samples.
-    //     The hardware audio clock is the ground truth — no wall-clock drift.
+    //   • PTS-driven: frame is displayed when the audio clock (derived from
+    //     samples_played and the timestamp of the first audio chunk) reaches the
+    //     frame's pts_us.  The hardware audio clock is ground truth — no drift.
     //   • Fallback (no audio): wall-clock pacing at the declared fps.
-    //   • Underrun (queue empty): last frame holds; video_frames_shown stays put
-    //     so the next arriving frame shows immediately without a catch-up burst.
+    //   • Underrun (queue empty): last frame holds; audio clock keeps advancing
+    //     so the next frame shows as soon as it arrives, without burst catch-up.
     fn advance_video(&mut self) {
         if self.prebuffering {
             if self.video_queue.len() < self.prebuffer_target {
@@ -181,42 +186,46 @@ impl ClientApp {
             }
             self.prebuffering = false;
             self.next_frame_due = Instant::now();
-            self.video_frames_shown = 0;
-            // Open audio now and flush held chunks so both start at the same instant.
-            if let Some((sr, ch)) = self.audio_format {
-                match CpalPlayer::new(sr, ch, 0) {
-                    Ok(player) => {
-                        for chunk in self.audio_prebuf.drain(..) {
-                            player.push(chunk);
-                        }
-                        self.audio_out = Some(player);
+
+            // Open audio and flush held chunks so both start at the same instant.
+            let sr = self.audio_sample_rate;
+            let ch = self.audio_channels as u16;
+            match CpalPlayer::new(sr, ch, 0) {
+                Ok(player) => {
+                    // Anchor the audio clock to the pts of the first buffered chunk.
+                    self.audio_base_pts     = self.audio_prebuf.first().map_or(0, |c| c.0);
+                    self.audio_base_samples = 0;
+                    for (_, samples) in self.audio_prebuf.drain(..) {
+                        player.push(samples);
                     }
-                    Err(e) => eprintln!("[audio] output unavailable: {e}"),
+                    self.audio_out = Some(player);
                 }
+                Err(e) => eprintln!("[audio] output unavailable: {e}"),
             }
         }
 
         if let Some(player) = &self.audio_out {
-            // Audio-driven timing: show all frames whose audio has already played.
-            let samples_played = player.samples_played();
+            // Compute current audio presentation position from the hardware sample counter.
+            let rate = self.audio_sample_rate as u64 * self.audio_channels as u64;
+            let samples_since_base = player.samples_played().saturating_sub(self.audio_base_samples);
+            let audio_pts = self.audio_base_pts + samples_since_base * 1_000_000 / rate;
+
             let mut redrawn = false;
             loop {
-                let due_at = (self.video_frames_shown as f64 * self.audio_samples_per_frame) as u64;
-                if samples_played < due_at { break; }
-                match self.video_queue.pop_front() {
-                    Some(frame) => {
+                match self.video_queue.front() {
+                    Some(frame) if audio_pts >= frame.pts_us => {
+                        let frame = self.video_queue.pop_front().unwrap();
                         self.blit_frame(&frame);
-                        self.video_frames_shown += 1;
                         redrawn = true;
                     }
-                    None => break, // underrun: hold current frame, don't advance counter
+                    _ => break, // not yet due, or queue empty
                 }
             }
             if redrawn {
                 if let Some(w) = &self.window { w.request_redraw(); }
             }
         } else {
-            // No audio output: wall-clock fallback.
+            // No audio output: wall-clock fallback at declared fps.
             let now = Instant::now();
             if now < self.next_frame_due { return; }
             if let Some(frame) = self.video_queue.pop_front() {
@@ -225,9 +234,7 @@ impl ClientApp {
                 );
                 self.blit_frame(&frame);
                 self.next_frame_due += frame_dur;
-                if self.next_frame_due + frame_dur < now {
-                    self.next_frame_due = now;
-                }
+                if self.next_frame_due + frame_dur < now { self.next_frame_due = now; }
                 if let Some(w) = &self.window { w.request_redraw(); }
             }
         }
@@ -252,12 +259,13 @@ impl ClientApp {
                         }
                     }
                     // Reset the playback buffer for the new stream.
-                    self.playback_fps = fps.max(1);
-                    self.audio_samples_per_frame =
-                        sample_rate as f64 * channels as f64 / self.playback_fps as f64;
-                    self.video_frames_shown = 0;
+                    self.playback_fps      = fps.max(1);
+                    self.audio_sample_rate = sample_rate;
+                    self.audio_channels    = channels as u32;
                     self.video_queue.clear();
                     self.prebuffering = true;
+                    self.audio_base_pts     = 0;
+                    self.audio_base_samples = 0;
                     // Size the video queue to hold the full pre-seeded cache tail plus
                     // a live-playback cushion. Cap at 10× the FPS to stay reasonable.
                     self.video_queue_cap = ((cache_secs * self.playback_fps as f32).ceil() as usize)
@@ -270,8 +278,7 @@ impl ClientApp {
                         .clamp(1, (self.video_queue_cap / 2) as u64) as usize;
                     // Defer audio output creation until the video prebuffer is
                     // satisfied so audio and video start at the same instant.
-                    self.audio_out    = None;
-                    self.audio_format = Some((sample_rate, channels as u16));
+                    self.audio_out = None;
                     self.audio_prebuf.clear();
                 }
 
@@ -285,10 +292,10 @@ impl ClientApp {
                     // Blitting and redraw are handled by advance_video in about_to_wait.
                 }
 
-                ClientEvent::AudioChunk(samples) => {
+                ClientEvent::AudioChunk { pts_us, samples } => {
                     if self.prebuffering {
-                        // Hold audio until video is ready so they start together.
-                        self.audio_prebuf.push(samples);
+                        // Hold audio until video is ready; preserve pts for clock anchoring.
+                        self.audio_prebuf.push((pts_us, samples));
                     } else if let Some(player) = &self.audio_out {
                         player.push(samples);
                     }

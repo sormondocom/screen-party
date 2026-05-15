@@ -16,7 +16,7 @@ use std::sync::{
     mpsc::{self, SyncSender},
     Arc, Mutex,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::cipher::{EncryptedReader, EncryptedWriter, EphemeralKeypair, Role};
 use super::stream_cache::{CacheEntry, StreamCache};
@@ -64,6 +64,8 @@ pub struct Broadcaster {
     sample_rate:      u32,
     channels:         u16,
     cache_secs:       f32,
+    /// Monotonic clock origin shared by all video-frame and audio-chunk timestamps.
+    start_time:       Instant,
     /// Actual capture region dimensions and fps; (0,0,0) while no region is selected.
     stream_dims:  Mutex<(u32, u32, u8)>,
     clients:      Arc<Mutex<Vec<ClientHandle>>>,
@@ -90,6 +92,7 @@ impl Broadcaster {
             sample_rate,
             channels,
             cache_secs,
+            start_time:  Instant::now(),
             stream_dims: Mutex::new((0, 0, 0)),
             clients:     Arc::new(Mutex::new(Vec::new())),
             pending:     Arc::new(Mutex::new(Vec::new())),
@@ -97,6 +100,11 @@ impl Broadcaster {
             chat_notify: Arc::new(Mutex::new(None)),
             cache:       StreamCache::new(capacity),
         })
+    }
+
+    /// Microseconds elapsed since the broadcaster was created — the shared A/V clock.
+    pub fn elapsed_us(&self) -> u64 {
+        self.start_time.elapsed().as_micros() as u64
     }
 
     pub fn listen(self: &Arc<Self>, port: u16) {

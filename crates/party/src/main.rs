@@ -394,7 +394,7 @@ impl App {
                         let dirty = detector.feed(frame.clone());
                         if !dirty.is_empty() {
                             if let Some(b) = &broadcaster {
-                                match net::proto::encode_video_frame(&dirty, &frame) {
+                                match net::proto::encode_video_frame(b.elapsed_us(), &dirty, &frame) {
                                     Ok(payload) => b.broadcast(Arc::new(net::BroadcastMsg::VideoFrame(Arc::new(payload)))),
                                     Err(e) => eprintln!("encode error: {e}"),
                                 }
@@ -1017,7 +1017,7 @@ fn run_host_gui(port: u16, cache_secs: f32) {
             .spawn(move || loop {
                 match capturer.next_frame() {
                     Ok(frame) => {
-                        let payload = Arc::new(net::proto::encode_audio_chunk(&frame.samples));
+                        let payload = Arc::new(net::proto::encode_audio_chunk(b.elapsed_us(), &frame.samples));
                         b.broadcast(Arc::new(net::BroadcastMsg::AudioChunk(payload)));
                     }
                     Err(e) => {

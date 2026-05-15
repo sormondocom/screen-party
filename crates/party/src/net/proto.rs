@@ -214,9 +214,9 @@ pub fn decode_stream_info(p: &[u8]) -> io::Result<StreamInfo> {
 
 /// Encode dirty rects + their pixels from `frame` into a compressed VIDEO_FRAME payload.
 ///
-/// Raw layout (before zstd): `[u32 frame_w][u32 frame_h][u32 rect_count]{ rect_header + pixels }…`
-/// The whole thing is then zstd-compressed at level 1 (fast).
-pub fn encode_video_frame(rects: &[Rect], frame: &Frame) -> io::Result<Vec<u8>> {
+/// Wire layout: `[u64 pts_us][zstd( [u32 w][u32 h][u32 rect_count]{ rect_header + pixels }… )]`
+/// The pts_us prefix is uncompressed so it can be read without decompressing.
+pub fn encode_video_frame(pts_us: u64, rects: &[Rect], frame: &Frame) -> io::Result<Vec<u8>> {
     let mut raw = Vec::new();
     raw.extend_from_slice(&frame.width.to_le_bytes());
     raw.extend_from_slice(&frame.height.to_le_bytes());
@@ -233,7 +233,11 @@ pub fn encode_video_frame(rects: &[Rect], frame: &Frame) -> io::Result<Vec<u8>> 
             raw.extend_from_slice(&frame.data[off..off + r.width as usize * 4]);
         }
     }
-    zstd::encode_all(std::io::Cursor::new(raw), 1)
+    let compressed = zstd::encode_all(std::io::Cursor::new(raw), 1)?;
+    let mut out = Vec::with_capacity(8 + compressed.len());
+    out.extend_from_slice(&pts_us.to_le_bytes());
+    out.extend_from_slice(&compressed);
+    Ok(out)
 }
 
 // ── Chat message (bidirectional) ──────────────────────────────────────────────
@@ -276,13 +280,17 @@ pub struct DecodedRect {
 }
 
 pub struct DecodedFrame {
+    /// Host-side capture timestamp in microseconds (same clock as audio chunks).
+    pub pts_us: u64,
     pub width:  u32,
     pub height: u32,
     pub rects:  Vec<DecodedRect>,
 }
 
 pub fn decode_video_frame(payload: &[u8]) -> io::Result<DecodedFrame> {
-    let payload = zstd::decode_all(payload)?;
+    if payload.len() < 8 { return Err(bad("frame payload too short")); }
+    let pts_us  = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let payload = zstd::decode_all(&payload[8..])?;
     let payload = payload.as_slice();
     if payload.len() < 12 { return Err(bad("frame payload too short")); }
     let width      = u32::from_le_bytes(payload[0..4].try_into().unwrap());
@@ -303,25 +311,30 @@ pub fn decode_video_frame(payload: &[u8]) -> io::Result<DecodedFrame> {
         off += px_len;
         rects.push(DecodedRect { x, y, w, pixels });
     }
-    Ok(DecodedFrame { width, height, rects })
+    Ok(DecodedFrame { pts_us, width, height, rects })
 }
 
 // ── Audio chunk (bidirectional) ───────────────────────────────────────────────
 
-/// Encode interleaved f32 samples as little-endian bytes.
-pub fn encode_audio_chunk(samples: &[f32]) -> Vec<u8> {
-    let mut b = Vec::with_capacity(samples.len() * 4);
+/// Encode interleaved f32 samples with a capture timestamp.
+/// Wire layout: `[u64 pts_us][f32 f32 …]` (all little-endian).
+pub fn encode_audio_chunk(pts_us: u64, samples: &[f32]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(8 + samples.len() * 4);
+    b.extend_from_slice(&pts_us.to_le_bytes());
     for &s in samples {
         b.extend_from_slice(&s.to_le_bytes());
     }
     b
 }
 
-/// Decode a raw-f32-LE audio payload back to samples.
-pub fn decode_audio_chunk(p: &[u8]) -> Vec<f32> {
-    p.chunks_exact(4)
+/// Decode an audio payload; returns `(pts_us, samples)`.
+pub fn decode_audio_chunk(p: &[u8]) -> (u64, Vec<f32>) {
+    if p.len() < 8 { return (0, vec![]); }
+    let pts_us = u64::from_le_bytes(p[0..8].try_into().unwrap());
+    let samples = p[8..].chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+        .collect();
+    (pts_us, samples)
 }
 
 fn bad(msg: &'static str) -> io::Error {

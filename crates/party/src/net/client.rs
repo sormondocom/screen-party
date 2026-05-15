@@ -23,7 +23,7 @@ pub enum ClientEvent {
         cache_secs:  f32,
     },
     VideoFrame(proto::DecodedFrame),
-    AudioChunk(Vec<f32>),
+    AudioChunk { pts_us: u64, samples: Vec<f32> },
     ChatMessage { sender: String, text: String },
     PeerInfo { host_fingerprint: String, trusted: bool },
     Disconnected { reason: String },
@@ -221,8 +221,8 @@ pub fn run_network(
                 }
             }
             proto::msg::AUDIO_CHUNK => {
-                let samples = proto::decode_audio_chunk(&payload);
-                let _ = event_tx.send(ClientEvent::AudioChunk(samples));
+                let (pts_us, samples) = proto::decode_audio_chunk(&payload);
+                let _ = event_tx.send(ClientEvent::AudioChunk { pts_us, samples });
             }
             proto::msg::CHAT_MSG => {
                 if let Ok(chat) = proto::decode_chat_msg(&payload) {
