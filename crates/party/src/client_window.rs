@@ -27,8 +27,9 @@ use crate::net::proto::DecodedFrame;
 
 const CHAR_W:      u32 = 9;  // 8px glyph + 1px letter spacing
 const CHAR_H:      u32 = 11; // 8px glyph + 3px line gap
-const CHAT_LINES:  usize = 28;
+const CHAT_LINES:  usize = 4; // visible history lines in the default strip
 const CHAT_PAD:    u32 = 8;
+// identity header + CHAT_LINES history + input line
 const CHAT_HEIGHT: u32 = CHAT_PAD * 2 + (CHAT_LINES as u32 + 2) * CHAR_H + 4;
 
 // Default video queue capacity before StreamInfo arrives. Overridden once the
@@ -61,12 +62,16 @@ struct ClientApp {
     audio_format: Option<(u32, u16)>,  // (sample_rate, channels) — set on StreamInfo
     audio_prebuf: Vec<Vec<f32>>,       // audio held until video prebuffer is satisfied
     // Video playback buffer
-    video_queue:      VecDeque<DecodedFrame>,
-    video_queue_cap:  usize,  // sized from host cache_secs on StreamInfo
-    playback_fps:     u8,
-    next_frame_due:   Instant,
-    prebuffering:     bool,
-    prebuffer_target: usize, // frames to accumulate before first display (from speed-test)
+    video_queue:           VecDeque<DecodedFrame>,
+    video_queue_cap:       usize,  // sized from host cache_secs on StreamInfo
+    playback_fps:          u8,
+    // Audio-driven A/V sync: video frame N is shown when samples_played >= N * spf.
+    audio_samples_per_frame: f64,  // sample_rate * channels / fps
+    video_frames_shown:    u64,
+    // Wall-clock fallback used only when audio output is unavailable.
+    next_frame_due:        Instant,
+    prebuffering:          bool,
+    prebuffer_target:      usize, // frames to accumulate before first display (from speed-test)
     // Identity
     client_fp:    String,
     host_fp:      String,
@@ -104,12 +109,14 @@ impl ClientApp {
             audio_out:       None,
             audio_format:    None,
             audio_prebuf:    Vec::new(),
-            video_queue:      VecDeque::new(),
-            video_queue_cap:  VIDEO_QUEUE_DEFAULT,
-            playback_fps:     30,
-            next_frame_due:   Instant::now(),
-            prebuffering:     true,
-            prebuffer_target: 2,
+            video_queue:             VecDeque::new(),
+            video_queue_cap:         VIDEO_QUEUE_DEFAULT,
+            playback_fps:            30,
+            audio_samples_per_frame: 3200.0, // 48000 * 2 / 30 — updated on StreamInfo
+            video_frames_shown:      0,
+            next_frame_due:          Instant::now(),
+            prebuffering:            true,
+            prebuffer_target:        1,
             client_fp,
             host_fp:         String::new(),
             host_trusted:    None,
@@ -136,8 +143,9 @@ impl ClientApp {
             self.stream_h = frame.height;
             self.video_buf = vec![0u32; (frame.width * frame.height) as usize];
             if let Some(w) = &self.window {
+                let chat_h = if self.chat_h == 0 { CHAT_HEIGHT } else { self.chat_h };
                 let _ = w.request_inner_size(
-                    winit::dpi::PhysicalSize::new(frame.width, frame.height),
+                    winit::dpi::PhysicalSize::new(frame.width, frame.height + chat_h),
                 );
             }
         }
@@ -156,16 +164,16 @@ impl ClientApp {
         }
     }
 
-    // Pop one frame from the playback queue if it is due, blit it, and request
-    // a redraw.  Called every about_to_wait tick.
+    // Pop frames from the playback queue and blit them when the audio clock says they're due.
     //
-    // Behaviour:
-    //   • Prebuffering: holds display until VIDEO_PREBUFFER_FRAMES have
-    //     accumulated, absorbing initial network jitter before first paint.
-    //   • Normal: one frame per 1/fps seconds; clock advances on each blit.
-    //   • Underrun (queue empty): last frame stays on screen; clock pauses
-    //     so playback resumes from where it froze, not a burst catch-up.
-    //   • Overrun (> VIDEO_MAX_QUEUE): drain_events already drops oldest.
+    // Timing:
+    //   • Prebuffering: accumulate video and audio together; release both at once.
+    //   • Audio-driven: frame N is displayed when CpalPlayer has consumed
+    //     N × (sample_rate × channels / fps) interleaved f32 samples.
+    //     The hardware audio clock is the ground truth — no wall-clock drift.
+    //   • Fallback (no audio): wall-clock pacing at the declared fps.
+    //   • Underrun (queue empty): last frame holds; video_frames_shown stays put
+    //     so the next arriving frame shows immediately without a catch-up burst.
     fn advance_video(&mut self) {
         if self.prebuffering {
             if self.video_queue.len() < self.prebuffer_target {
@@ -173,8 +181,8 @@ impl ClientApp {
             }
             self.prebuffering = false;
             self.next_frame_due = Instant::now();
-            // Open audio and flush the pre-buffered chunks so it starts
-            // in lock-step with the first video frame.
+            self.video_frames_shown = 0;
+            // Open audio now and flush held chunks so both start at the same instant.
             if let Some((sr, ch)) = self.audio_format {
                 match CpalPlayer::new(sr, ch, 0) {
                     Ok(player) => {
@@ -188,30 +196,41 @@ impl ClientApp {
             }
         }
 
-        let now = Instant::now();
-        if now < self.next_frame_due {
-            return;
-        }
-
-        if let Some(frame) = self.video_queue.pop_front() {
-            let frame_dur = Duration::from_nanos(
-                1_000_000_000 / self.playback_fps.max(1) as u64,
-            );
-            self.blit_frame(&frame);
-            // += keeps the deadline grid fixed regardless of when about_to_wait fires,
-            // preventing cumulative drift. The snap-forward guard prevents burst
-            // catch-up after an underrun: if we're still more than one frame behind
-            // after advancing, jump the clock to now so only one frame is shown early.
-            self.next_frame_due += frame_dur;
-            if self.next_frame_due + frame_dur < now {
-                self.next_frame_due = now;
+        if let Some(player) = &self.audio_out {
+            // Audio-driven timing: show all frames whose audio has already played.
+            let samples_played = player.samples_played();
+            let mut redrawn = false;
+            loop {
+                let due_at = (self.video_frames_shown as f64 * self.audio_samples_per_frame) as u64;
+                if samples_played < due_at { break; }
+                match self.video_queue.pop_front() {
+                    Some(frame) => {
+                        self.blit_frame(&frame);
+                        self.video_frames_shown += 1;
+                        redrawn = true;
+                    }
+                    None => break, // underrun: hold current frame, don't advance counter
+                }
             }
-            if let Some(w) = &self.window {
-                w.request_redraw();
+            if redrawn {
+                if let Some(w) = &self.window { w.request_redraw(); }
+            }
+        } else {
+            // No audio output: wall-clock fallback.
+            let now = Instant::now();
+            if now < self.next_frame_due { return; }
+            if let Some(frame) = self.video_queue.pop_front() {
+                let frame_dur = Duration::from_nanos(
+                    1_000_000_000 / self.playback_fps.max(1) as u64,
+                );
+                self.blit_frame(&frame);
+                self.next_frame_due += frame_dur;
+                if self.next_frame_due + frame_dur < now {
+                    self.next_frame_due = now;
+                }
+                if let Some(w) = &self.window { w.request_redraw(); }
             }
         }
-        // Queue empty → clock stays frozen at next_frame_due so the next
-        // arriving frame shows immediately without a burst of catch-up frames.
     }
 
     fn drain_events(&mut self) {
@@ -226,13 +245,17 @@ impl ClientApp {
                         self.stream_h = height;
                         self.video_buf = vec![0u32; (width * height) as usize];
                         if let Some(w) = &self.window {
+                            let chat_h = if self.chat_h == 0 { CHAT_HEIGHT } else { self.chat_h };
                             let _ = w.request_inner_size(
-                                winit::dpi::PhysicalSize::new(width, height),
+                                winit::dpi::PhysicalSize::new(width, height + chat_h),
                             );
                         }
                     }
                     // Reset the playback buffer for the new stream.
                     self.playback_fps = fps.max(1);
+                    self.audio_samples_per_frame =
+                        sample_rate as f64 * channels as f64 / self.playback_fps as f64;
+                    self.video_frames_shown = 0;
                     self.video_queue.clear();
                     self.prebuffering = true;
                     // Size the video queue to hold the full pre-seeded cache tail plus
@@ -309,18 +332,26 @@ impl ClientApp {
         let Ok(mut buf) = srf.buffer_mut() else { return };
         let (w, h) = (sz.width, sz.height);
 
-        // ── Video background (nearest-neighbour scale-to-fill) ────────────────
-        if self.stream_w == 0 || self.stream_h == 0 {
-            buf.fill(0x00_11_11_11);
-            draw_str(&mut buf, w, 20, 20, "Connecting...", COLOR_TEXT);
+        // ── Video area (above chat strip, nearest-neighbour scale-to-fill) ───
+        let chat_h  = if self.chat_h == 0 { CHAT_HEIGHT } else { self.chat_h.min(h) };
+        let panel_y = h.saturating_sub(chat_h);
+
+        if self.stream_w == 0 || self.stream_h == 0 || panel_y == 0 {
+            for row in 0..panel_y as usize {
+                let base = row * w as usize;
+                buf[base..base + w as usize].fill(0x00_11_11_11);
+            }
+            if panel_y > 20 {
+                draw_str(&mut buf, w, 20, 20, "Connecting...", COLOR_TEXT);
+            }
         } else {
             // Precompute source column indices once per row to halve divisions.
             let src_cols: Vec<usize> = (0..w as usize)
                 .map(|c| (c * self.stream_w as usize / w as usize)
                     .min(self.stream_w as usize - 1))
                 .collect();
-            for dst_row in 0..(h as usize) {
-                let src_row = (dst_row * self.stream_h as usize / h as usize)
+            for dst_row in 0..(panel_y as usize) {
+                let src_row = (dst_row * self.stream_h as usize / panel_y as usize)
                     .min(self.stream_h as usize - 1);
                 let src_base = src_row * self.stream_w as usize;
                 let dst_base = dst_row * w as usize;
@@ -331,8 +362,7 @@ impl ClientApp {
         }
 
         // ── Chat panel ────────────────────────────────────────────────────────
-        let chat_h  = if self.chat_h == 0 { CHAT_HEIGHT } else { self.chat_h.min(h) };
-        let panel_y = h.saturating_sub(chat_h);
+        // panel_y and chat_h already computed above for the video area.
         let chat_w  = if self.chat_w == 0 { w } else { self.chat_w.min(w) };
 
         for row in panel_y..h {
@@ -446,7 +476,7 @@ impl ApplicationHandler for ClientApp {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
             .with_title("Screen Party — viewer")
-            .with_inner_size(winit::dpi::PhysicalSize::new(1280u32, 720u32));
+            .with_inner_size(winit::dpi::PhysicalSize::new(1280u32, 720 + CHAT_HEIGHT));
         let w = match el.create_window(attrs) {
             Ok(w) => Rc::new(w),
             Err(e) => { eprintln!("client window: {e}"); return; }

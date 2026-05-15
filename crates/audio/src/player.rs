@@ -9,7 +9,9 @@
 //! Set to 0 for immediate playback (no buffering).
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::Arc;
 use std::thread;
 
 use cpal::{
@@ -25,6 +27,8 @@ pub struct CpalPlayer {
     tx:    mpsc::Sender<Vec<f32>>,
     /// Dropping this closes the channel, signalling the player thread to stop.
     _stop: SyncSender<()>,
+    /// Interleaved f32 samples consumed by the CPAL callback — used as the A/V sync clock.
+    samples_played: Arc<AtomicU64>,
 }
 
 impl CpalPlayer {
@@ -56,19 +60,27 @@ impl CpalPlayer {
         let (sample_tx, sample_rx) = mpsc::channel::<Vec<f32>>();
         let (stop_tx,   stop_rx)   = mpsc::sync_channel::<()>(1);
 
+        let samples_played = Arc::new(AtomicU64::new(0));
+        let sp = samples_played.clone();
+
         thread::Builder::new()
             .name("audio-player".into())
             .spawn(move || {
-                player_thread(config, sample_format, sample_rx, stop_rx, prebuffer_samples)
+                player_thread(config, sample_format, sample_rx, stop_rx, prebuffer_samples, sp)
             })
             .map_err(|e| AudioError::Backend(e.to_string()))?;
 
-        Ok(Self { tx: sample_tx, _stop: stop_tx })
+        Ok(Self { tx: sample_tx, _stop: stop_tx, samples_played })
     }
 
     /// Queue a batch of interleaved f32 samples for playback.
     pub fn push(&self, samples: Vec<f32>) {
         let _ = self.tx.send(samples);
+    }
+
+    /// Interleaved f32 samples consumed by the hardware callback — use as the video sync clock.
+    pub fn samples_played(&self) -> u64 {
+        self.samples_played.load(Ordering::Relaxed)
     }
 }
 
@@ -80,6 +92,7 @@ fn player_thread(
     rx:                Receiver<Vec<f32>>,
     stop_rx:           Receiver<()>,
     prebuffer_samples: usize,
+    samples_played:    Arc<AtomicU64>,
 ) {
     let host   = cpal::default_host();
     let device = match host.default_output_device() {
@@ -108,7 +121,10 @@ fn player_thread(
                 }
                 prebuffering = false;
             }
+            let before = acc.len();
             fill_output(data, &mut acc);
+            // Count real samples consumed (before - after); this is the A/V sync clock.
+            samples_played.fetch_add((before - acc.len()) as u64, Ordering::Relaxed);
         },
         err_fn,
         None,
